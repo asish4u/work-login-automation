@@ -2,6 +2,8 @@
 
 const { firefox } = require('playwright');
 const path = require('path');
+const { exec } = require('child_process');
+const fs = require('fs');
 require('dotenv').config();
 
 const loginUrl = process.env.WORK_LOGIN_URL || 'https://citrix.amerihealthcaritas.com/Citrix/PRDStoreWeb/';
@@ -30,6 +32,36 @@ console.log('Starting login automation...');
 
   const page = await context.newPage();
 
+  // Handle downloads
+  let icaFilePath = null;
+  page.on('download', async download => {
+    const suggested = download.suggestedFilename();
+    if (suggested.endsWith('.ica')) {
+      console.log(`\n📥 ICA file download started: ${suggested}`);
+      icaFilePath = path.join('/Users/nayak/Downloads', suggested);
+      await download.saveAs(icaFilePath);
+      console.log(`✅ ICA saved to: ${icaFilePath}`);
+      
+      // Auto-launch Citrix Workspace
+      const workspacePaths = [
+        '/Applications/Citrix Workspace.app',
+        '/Applications/Citrix Receiver.app'
+      ];
+      
+      for (const appPath of workspacePaths) {
+        if (fs.existsSync(appPath)) {
+          console.log(`🚀 Launching Citrix with: ${appPath}`);
+          exec(`open -a "${appPath}" "${icaFilePath}"`, (err) => {
+            if (err) console.log('Launch error:', err.message);
+            else console.log('✅ Citrix session launched!');
+          });
+          return;
+        }
+      }
+      console.log('⚠️ Citrix Workspace/Receiver not found. Please launch manually.');
+    }
+  });
+
   console.log('Loading Citrix...');
   await page.goto(loginUrl, { timeout: 60000, waitUntil: 'domcontentloaded' });
   await page.waitForTimeout(5000);
@@ -51,15 +83,45 @@ console.log('Starting login automation...');
       // SUCCESS - Citrix Store
       if (url.includes('/Citrix/StoreWeb') || (url.includes('/Citrix/') && !url.includes('login') && !url.includes('saml') && !url.includes('microsoft') && !url.includes('safenet'))) {
         console.log('\n✅ SUCCESS: Logged into Citrix!');
+        
+        // Try to find and click a Launch button
+        console.log('🔍 Looking for app/desktop to launch...');
+        await page.waitForTimeout(3000);
+        
+        const launchSelectors = [
+          'button:has-text("Launch")',
+          'a:has-text("Launch")',
+          '[data-automation="launch-button"]',
+          'button[title*="Launch" i]',
+          '.launch-button',
+          'button:has-text("Desktop")',
+          'button:has-text("App")',
+          '.app-item button',
+          'button[class*="launch" i]'
+        ];
+        
+        for (const selector of launchSelectors) {
+          try {
+            const btn = page.locator(selector).first();
+            if (await btn.isVisible({ timeout: 2000 })) {
+              console.log(`🚀 Clicking launch button: ${selector}`);
+              await btn.click();
+              // Wait for download or new page
+              await page.waitForTimeout(5000);
+              break;
+            }
+          } catch (e) {}
+        }
+        
         break;
       }
 
-      // SAML redirect - wait for Microsoft
+      // SAML redirect
       if (url.includes('saml2') || url.includes('/saml/')) {
         console.log('.');
       }
 
-      // 1. Email stage (Microsoft)
+      // 1. Email stage
       if (stage === 0) {
         try {
           const emailInp = page.locator('input[name="loginfmt"], input[type="email"]').first();
@@ -80,6 +142,18 @@ console.log('Starting login automation...');
           const passInp = page.locator('input[name="passwd"]').first();
           if (await passInp.isVisible({ timeout: 3000 })) {
             console.log('🔐 Password...');
+            
+            // Smart card bypass
+            try {
+              const usePwdBtn = page.locator('button:has-text("password")').first();
+              if (await usePwdBtn.isVisible({ timeout: 500 })) {
+                console.log('  Using password option...');
+                await usePwdBtn.click();
+                await page.waitForTimeout(2000);
+                continue;
+              }
+            } catch (e) {}
+            
             await passInp.fill(password);
             await page.keyboard.press('Enter');
             await page.waitForTimeout(8000);
@@ -103,13 +177,10 @@ console.log('Starting login automation...');
         } catch (e) {}
       }
 
-      // 4. MFA - multiple possible providers
+      // 4. MFA detection
       const mfaProviders = [
         { name: 'Microsoft', pattern: 'Authenticator' },
         { name: 'SafeNet', pattern: 'safenet' },
-        { name: 'MobileIron', pattern: 'MobileIron' },
-        { name: 'Duo', pattern: 'Duo' },
-        { name: 'Okta', pattern: 'Okta' },
         { name: 'Verify', pattern: 'verification' }
       ];
 
@@ -121,8 +192,7 @@ console.log('Starting login automation...');
           console.log('Complete MFA in browser or on phone');
           console.log('=====================================');
           
-          // Wait for MFA completion
-          for (let i = 0; i < 72; i++) { // 6 min max
+          for (let i = 0; i < 72; i++) {
             await page.waitForTimeout(5000);
             const curUrl = page.url();
             
@@ -156,4 +226,7 @@ console.log('Starting login automation...');
   console.log('\n--- Final URL:', page.url());
   console.log('✅ Done!');
   
+  // Keep browser open briefly for any pending downloads
+  await page.waitForTimeout(5000);
+  await context.close();
 })();
