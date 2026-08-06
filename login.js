@@ -55,8 +55,10 @@ console.log('Starting login automation...');
   await page.goto(LOGIN_URL, { timeout: 60000, waitUntil: 'domcontentloaded' });
   await page.waitForTimeout(5000);
 
-  // State tracking
-  let emailSubmitted = false;
+  // State tracking - uses separate flags for each step
+  let emailFilled = false;      // email field has been filled
+  let emailSubmitted = false;   // email form submitted (Next clicked)
+  let passwordFilled = false;
   let passwordSubmitted = false;
   let mfaCompleted = false;
   let citrixReached = false;
@@ -66,76 +68,164 @@ console.log('Starting login automation...');
     const url = page.url();
     console.log('\n[' + attempt + '] URL: ' + url);
 
-    // 1. Email page (SAML/ADFS/Microsoft) - submit username
-    // Microsoft uses input[name="loginfmt"]; ADFS uses input[name="UserName"]
-    const emailSelectors = [
-      'input[name="loginfmt"]',
-      'input[name="UserName"]',
-      'input[name="Email"]',
-      'input[id="i0116"]',
-      'input[type="email"]'
-    ];
-    let emailField = null;
-    for (const selector of emailSelectors) {
-      const input = page.locator(selector).first();
-      if (await input.isEnabled({ timeout: 1000 }).catch(() => false)) {
-        emailField = input;
-        break;
+    // 1. Email page (SAML/ADFS/Microsoft) - fill username
+    // Wait for navigation after submitting before checking password page
+    if (!emailSubmitted) {
+      const emailSelectors = [
+        'input[name="loginfmt"]',
+        'input[name="UserName"]',
+        'input[name="Email"]',
+        'input[id="i0116"]',
+        'input[type="email"]'
+      ];
+      let emailField = null;
+      for (const selector of emailSelectors) {
+        const input = page.locator(selector).first();
+        if (await input.isEnabled({ timeout: 1000 }).catch(() => false)) {
+          emailField = input;
+          break;
+        }
       }
-    }
-    if (emailField) {
-      console.log('[STEP] Email page detected, filling...');
-      await emailField.fill(USERNAME);
-      await page.keyboard.press('Enter');
-      emailSubmitted = true;
-      await page.waitForTimeout(3000);
-      continue;
+      if (emailField) {
+        if (!emailFilled) {
+          console.log('[STEP] Email page detected, filling username...');
+          await emailField.fill(USERNAME);
+          emailFilled = true;
+          // small wait for any JS validation
+          await page.waitForTimeout(500);
+        }
+        // Click "Next" button (Microsoft: idSIButton9; ADFS: submit button)
+        const nextSelectors = [
+          'input[id="idSIButton9"]',
+          'button[id="idSIButton9"]',
+          'button:has-text("Next")',
+          'button:has-text("Sign in")',
+          'input[type="submit"]',
+          'button[type="submit"]'
+        ];
+        let nextBtn = null;
+        for (const selector of nextSelectors) {
+          const btn = page.locator(selector).first();
+          if (await btn.isEnabled({ timeout: 2000 }).catch(() => false)) {
+            nextBtn = btn;
+            break;
+          }
+        }
+        if (nextBtn) {
+          console.log('[STEP] Clicking Next/Sign in...');
+          await Promise.all([
+            page.waitForNavigation({ timeout: 15000 }).catch(() => {}),
+            nextBtn.click()
+          ]);
+          emailSubmitted = true;
+          await page.waitForTimeout(3000);
+          continue;
+        } else {
+          // Fallback: press Enter
+          console.log('[STEP] No Next button, pressing Enter...');
+          await Promise.all([
+            page.waitForNavigation({ timeout: 15000 }).catch(() => {}),
+            page.keyboard.press('Enter')
+          ]);
+          emailSubmitted = true;
+          await page.waitForTimeout(3000);
+          continue;
+        }
+      }
+      // Email field not visible yet, loop and wait
     }
 
-    // 2. Password page - submit password (after email submitted)
-    // Microsoft uses input[name="passwd"]; ADFS uses input[name="Password"]
-    const passSelectors = [
-      'input[name="passwd"]',
-      'input[name="Password"]',
-      'input[id="i0118"]',
-      'input[type="password"]'
-    ];
-    let passField = null;
-    for (const selector of passSelectors) {
-      const input = page.locator(selector).first();
-      if (await input.isEnabled({ timeout: 1000 }).catch(() => false)) {
-        passField = input;
-        break;
+    // 2. Password page - fill password (after email submitted)
+    if (emailSubmitted && !passwordSubmitted) {
+      const passSelectors = [
+        'input[name="passwd"]',
+        'input[name="Password"]',
+        'input[id="i0118"]',
+        'input[type="password"]'
+      ];
+      let passField = null;
+      for (const selector of passSelectors) {
+        const input = page.locator(selector).first();
+        if (await input.isEnabled({ timeout: 1000 }).catch(() => false)) {
+          passField = input;
+          break;
+        }
       }
-    }
-    if (passField) {
-      console.log('[STEP] Password page detected, filling...');
-      await passField.fill(PASSWORD);
-      await page.keyboard.press('Enter');
-      passwordSubmitted = true;
-      await page.waitForTimeout(5000);
-      continue;
+      if (passField) {
+        if (!passwordFilled) {
+          console.log('[STEP] Password page detected, filling password...');
+          await passField.fill(PASSWORD);
+          passwordFilled = true;
+          await page.waitForTimeout(500);
+        }
+        // Click "Sign in" button (Microsoft: idSIButton9 reused)
+        const signInSelectors = [
+          'input[id="idSIButton9"]',
+          'button[id="idSIButton9"]',
+          'button:has-text("Sign in")',
+          'button:has-text("Log in")',
+          'input[type="submit"]',
+          'button[type="submit"]'
+        ];
+        let signInBtn = null;
+        for (const selector of signInSelectors) {
+          const btn = page.locator(selector).first();
+          if (await btn.isEnabled({ timeout: 2000 }).catch(() => false)) {
+            signInBtn = btn;
+            break;
+          }
+        }
+        if (signInBtn) {
+          console.log('[STEP] Clicking Sign in...');
+          await Promise.all([
+            page.waitForNavigation({ timeout: 15000 }).catch(() => {}),
+            signInBtn.click()
+          ]);
+          passwordSubmitted = true;
+          await page.waitForTimeout(5000);
+          continue;
+        } else {
+          console.log('[STEP] No Sign in button, pressing Enter...');
+          await Promise.all([
+            page.waitForNavigation({ timeout: 15000 }).catch(() => {}),
+            page.keyboard.press('Enter')
+          ]);
+          passwordSubmitted = true;
+          await page.waitForTimeout(5000);
+          continue;
+        }
+      }
+      // Password not visible yet; maybe still loading. Wait.
     }
 
     // 3. "Stay signed in" page - ONLY after password submitted
-    const staySelectors = [
-      'input[id="idSIButton9"]',
-      'button:has-text("Yes")',
-      'button:has-text("Stay signed in")'
-    ];
-    let stayField = null;
-    for (const selector of staySelectors) {
-      const btn = page.locator(selector).first();
-      if (await btn.isEnabled({ timeout: 1000 }).catch(() => false)) {
-        stayField = btn;
-        break;
+    if (passwordSubmitted) {
+      const staySelectors = [
+        'input[id="idSIButton9"]',
+        'button[id="idSIButton9"]',
+        'button:has-text("Yes")',
+        'button:has-text("Stay signed in")'
+      ];
+      let stayField = null;
+      for (const selector of staySelectors) {
+        const btn = page.locator(selector).first();
+        if (await btn.isEnabled({ timeout: 1000 }).catch(() => false)) {
+          // Avoid matching the sign-in button: ensure page is the KMSI page
+          stayField = btn;
+          break;
+        }
       }
-    }
-    if (passwordSubmitted && stayField) {
-      console.log('[STEP] Stay signed in page, clicking Yes...');
-      await stayField.click();
-      await page.waitForTimeout(3000);
-      continue;
+      // Only click if there's NO password field (i.e., truly a "stay signed in" page)
+      const hasPasswordField = await page.locator('input[type="password"]').first().isVisible({ timeout: 500 }).catch(() => false);
+      if (stayField && !hasPasswordField) {
+        console.log('[STEP] Stay signed in page, clicking Yes...');
+        await Promise.all([
+          page.waitForNavigation({ timeout: 15000 }).catch(() => {}),
+          stayField.click()
+        ]);
+        await page.waitForTimeout(3000);
+        continue;
+      }
     }
 
     // 4. MFA/Verification page - manual intervention
