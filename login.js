@@ -67,85 +67,74 @@ console.log('Starting login automation...');
     console.log('\n[' + attempt + '] URL: ' + url);
 
     // 1. Email page (SAML/ADFS/Microsoft) - submit username
+    // Microsoft uses input[name="loginfmt"]; ADFS uses input[name="UserName"]
     const emailSelectors = [
+      'input[name="loginfmt"]',
       'input[name="UserName"]',
       'input[name="Email"]',
       'input[id="i0116"]',
       'input[type="email"]'
     ];
-    let emailVisible = false;
+    let emailField = null;
     for (const selector of emailSelectors) {
-      if (await page.locator(selector).first().isVisible({ timeout: 1000 }).catch(() => false)) {
-        emailVisible = true;
+      const input = page.locator(selector).first();
+      if (await input.isEnabled({ timeout: 1000 }).catch(() => false)) {
+        emailField = input;
         break;
       }
     }
-    if (emailVisible && !emailSubmitted) {
+    if (emailField) {
       console.log('[STEP] Email page detected, filling...');
-      for (const selector of emailSelectors) {
-        const input = page.locator(selector).first();
-        if (await input.isVisible({ timeout: 2000 }).catch(() => false)) {
-          await input.fill(USERNAME);
-          await page.keyboard.press('Enter');
-          emailSubmitted = true;
-          await page.waitForTimeout(3000);
-          break;
-        }
-      }
+      await emailField.fill(USERNAME);
+      await page.keyboard.press('Enter');
+      emailSubmitted = true;
+      await page.waitForTimeout(3000);
       continue;
     }
 
     // 2. Password page - submit password (after email submitted)
+    // Microsoft uses input[name="passwd"]; ADFS uses input[name="Password"]
     const passSelectors = [
       'input[name="passwd"]',
+      'input[name="Password"]',
       'input[id="i0118"]',
       'input[type="password"]'
     ];
-    let passVisible = false;
+    let passField = null;
     for (const selector of passSelectors) {
-      if (await page.locator(selector).first().isVisible({ timeout: 1000 }).catch(() => false)) {
-        passVisible = true;
+      const input = page.locator(selector).first();
+      if (await input.isEnabled({ timeout: 1000 }).catch(() => false)) {
+        passField = input;
         break;
       }
     }
-    if (emailSubmitted && passVisible && !passwordSubmitted) {
+    if (passField) {
       console.log('[STEP] Password page detected, filling...');
-      for (const selector of passSelectors) {
-        const input = page.locator(selector).first();
-        if (await input.isVisible({ timeout: 2000 }).catch(() => false)) {
-          await input.fill(PASSWORD);
-          await page.keyboard.press('Enter');
-          passwordSubmitted = true;
-          await page.waitForTimeout(5000);
-          break;
-        }
-      }
+      await passField.fill(PASSWORD);
+      await page.keyboard.press('Enter');
+      passwordSubmitted = true;
+      await page.waitForTimeout(5000);
       continue;
     }
 
-    // 3. "Stay signed in" page
+    // 3. "Stay signed in" page - ONLY after password submitted
     const staySelectors = [
       'input[id="idSIButton9"]',
       'button:has-text("Yes")',
       'button:has-text("Stay signed in")'
     ];
-    let stayVisible = false;
+    let stayField = null;
     for (const selector of staySelectors) {
-      if (await page.locator(selector).first().isVisible({ timeout: 1000 }).catch(() => false)) {
-        stayVisible = true;
+      const btn = page.locator(selector).first();
+      if (await btn.isEnabled({ timeout: 1000 }).catch(() => false)) {
+        stayField = btn;
         break;
       }
     }
-    if (stayVisible) {
+    if (passwordSubmitted && stayField) {
       console.log('[STEP] Stay signed in page, clicking Yes...');
-      for (const selector of staySelectors) {
-        const btn = page.locator(selector).first();
-        if (await btn.isVisible({ timeout: 2000 }).catch(() => false)) {
-          await btn.click();
-          await page.waitForTimeout(3000);
-          break;
-        }
-      }
+      await stayField.click();
+      await page.waitForTimeout(3000);
       continue;
     }
 
