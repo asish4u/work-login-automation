@@ -32,7 +32,6 @@ console.log('Starting login automation...');
 
   const page = await context.newPage();
 
-  // Handle downloads
   let icaFilePath = null;
   page.on('download', async download => {
     const suggested = download.suggestedFilename();
@@ -42,7 +41,6 @@ console.log('Starting login automation...');
       await download.saveAs(icaFilePath);
       console.log(`✅ ICA saved to: ${icaFilePath}`);
       
-      // Auto-launch Citrix Workspace
       const workspacePaths = [
         '/Applications/Citrix Workspace.app',
         '/Applications/Citrix Receiver.app'
@@ -80,11 +78,9 @@ console.log('Starting login automation...');
         lastUrl = url;
       }
 
-      // SUCCESS - Citrix Store
       if (url.includes('/Citrix/StoreWeb') || (url.includes('/Citrix/') && !url.includes('login') && !url.includes('saml') && !url.includes('microsoft') && !url.includes('safenet'))) {
         console.log('\n✅ SUCCESS: Logged into Citrix!');
         
-        // Try to find and click a Launch button
         console.log('🔍 Looking for app/desktop to launch...');
         await page.waitForTimeout(3000);
         
@@ -106,7 +102,6 @@ console.log('Starting login automation...');
             if (await btn.isVisible({ timeout: 2000 })) {
               console.log(`🚀 Clicking launch button: ${selector}`);
               await btn.click();
-              // Wait for download or new page
               await page.waitForTimeout(5000);
               break;
             }
@@ -116,12 +111,10 @@ console.log('Starting login automation...');
         break;
       }
 
-      // SAML redirect
       if (url.includes('saml2') || url.includes('/saml/')) {
         console.log('.');
       }
 
-      // 1. Email stage
       if (stage === 0) {
         try {
           const emailInp = page.locator('input[name="loginfmt"], input[type="email"]').first();
@@ -136,14 +129,12 @@ console.log('Starting login automation...');
         } catch (e) {}
       }
 
-      // 2. Password stage
       if (stage <= 1) {
         try {
           const passInp = page.locator('input[name="passwd"]').first();
           if (await passInp.isVisible({ timeout: 3000 })) {
             console.log('🔐 Password...');
             
-            // Smart card bypass
             try {
               const usePwdBtn = page.locator('button:has-text("password")').first();
               if (await usePwdBtn.isVisible({ timeout: 500 })) {
@@ -163,7 +154,6 @@ console.log('Starting login automation...');
         } catch (e) {}
       }
 
-      // 3. Stay signed in
       if (stage <= 2) {
         try {
           const yesBtn = page.locator('input[value="Yes"]').first();
@@ -177,13 +167,13 @@ console.log('Starting login automation...');
         } catch (e) {}
       }
 
-      // 4. MFA detection
       const mfaProviders = [
         { name: 'Microsoft', pattern: 'Authenticator' },
         { name: 'SafeNet', pattern: 'safenet' },
         { name: 'Verify', pattern: 'verification' }
       ];
 
+      let mfaFound = false;
       for (const mfa of mfaProviders) {
         const mfaEl = page.locator(`text=${mfa.pattern}`).first();
         if (await mfaEl.isVisible({ timeout: 1000 }).catch(() => false)) {
@@ -193,40 +183,54 @@ console.log('Starting login automation...');
           console.log('=====================================');
           
           for (let i = 0; i < 72; i++) {
-            await page.waitForTimeout(5000);
-            const curUrl = page.url();
-            
-            if (curUrl.includes('/Citrix/StoreWeb') || (curUrl.includes('/Citrix/') && !curUrl.includes('login') && !curUrl.includes('microsoft') && !curUrl.includes('safenet'))) {
-              console.log('\n✅ SUCCESS! Citrix reached!');
+            try {
+              await page.waitForTimeout(5000);
+              const curUrl = page.url();
+              
+              if (curUrl.includes('/Citrix/StoreWeb') || (curUrl.includes('/Citrix/') && !curUrl.includes('login') && !curUrl.includes('microsoft') && !curUrl.includes('safenet'))) {
+                console.log('\n✅ SUCCESS! Citrix reached!');
+                mfaFound = true;
+                break;
+              }
+              
+              if (!curUrl.includes('login.') && !curUrl.includes('saml') && !curUrl.includes('safenet') && !curUrl.includes('auth')) {
+                console.log('\nGot:', curUrl.slice(-30));
+                mfaFound = true;
+                break;
+              }
+              
+              if (i % 6 === 0) process.stdout.write('.');
+            } catch (e) {
+              console.log('\n⚠️ Page closed during MFA wait');
               break;
             }
-            
-            if (!curUrl.includes('login.') && !curUrl.includes('saml') && !curUrl.includes('safenet') && !curUrl.includes('auth')) {
-              console.log('\nGot:', curUrl.slice(-30));
-              break;
-            }
-            
-            if (i % 6 === 0) process.stdout.write('.');
           }
           stage = 4;
           break;
         }
       }
       
-      if (stage === 4) break;
+      if (stage === 4) {
+        console.log('\n✓ MFA stage complete, continuing...');
+        // Don't break - try to continue if browser still alive
+        stage = 5;
+        continue;
+      }
 
       await page.waitForTimeout(2000);
       
     } catch (e) {
       console.log('Error:', e.message);
-      if (e.message.includes('closed')) break;
+      if (e.message.includes('closed')) {
+        console.log('Browser closed - exiting');
+        break;
+      }
     }
   }
 
   console.log('\n--- Final URL:', page.url());
   console.log('✅ Done!');
   
-  // Keep browser open briefly for any pending downloads
   await page.waitForTimeout(5000);
   await context.close();
 })();
