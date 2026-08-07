@@ -18,6 +18,34 @@ const { firefox } = require('playwright');
 const path = require('path');
 const fs = require('fs');
 const { exec } = require('child_process');
+
+// ── Single-instance guard ────────────────────────────────────────────────
+// Two concurrent runs share the same user_data profile and race each other's
+// form submissions (one submits an EMPTY password, the other fills ~10s later
+// and submits again). A PID lockfile prevents a second launch from ever doing
+// that: if a live instance is already running, we exit immediately. This makes
+// the empty-first-submit structurally impossible no matter how the script is
+// launched (app double-click, re-added Login Item, etc.).
+const LOCKFILE = path.join(__dirname, '.run.lock');
+function instanceAlreadyRunning() {
+  try {
+    const pid = parseInt(fs.readFileSync(LOCKFILE, 'utf8').trim(), 10);
+    if (Number.isNaN(pid)) return false;
+    // kill -0 checks the process exists without signalling it.
+    exec(`kill -0 ${pid}`);
+    return true;
+  } catch (_) {
+    return false; // lockfile missing or process dead -> free to run
+  }
+}
+if (instanceAlreadyRunning()) {
+  console.error('[citrix] Another instance is already running — exiting to avoid a double-submit.');
+  process.exit(0);
+}
+fs.writeFileSync(LOCKFILE, String(process.pid));
+process.on('exit', () => { try { fs.unlinkSync(LOCKFILE); } catch (_) {} });
+process.on('SIGINT', () => process.exit(0));
+process.on('SIGTERM', () => process.exit(0));
 require('dotenv').config();
 
 const LOGIN_URL = process.env.WORK_LOGIN_URL || 'https://citrix.amerihealthcaritas.com/Citrix/PRDStoreWeb/';
