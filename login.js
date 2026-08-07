@@ -334,7 +334,7 @@ async function safeWait(page, ms) {
           'input[id="idSIButton9"]', 'button[id="idSIButton9"]',
           'button:has-text("Yes")', 'button:has-text("Stay signed in")'
         ]);
-        if (clicked) { log('Clicked Stay-signed-in =', clicked); await page.waitForTimeout(2000); continue; }
+        if (clicked) { log('Clicked Stay-signed-in =', clicked); await page.waitForTimeout(800); continue; }
       }
     }
 
@@ -347,7 +347,7 @@ async function safeWait(page, ms) {
         'button:has-text("Continue")', 'a:has-text("Continue")',
         'input[type="submit"]', 'button[type="submit"]'
       ], { nav: false });
-      if (clicked) { log('Clicked Continue ->', clicked); continued = true; await page.waitForTimeout(3000); continue; }
+      if (clicked) { log('Clicked Continue ->', clicked); continued = true; await page.waitForTimeout(800); continue; }
     }
 
     // 5. 2FA — manual. Wait for human to enter code and land on StoreWeb.
@@ -364,34 +364,19 @@ async function safeWait(page, ms) {
         log('TIMEOUT: 2FA not completed within 5 minutes. Exiting.');
         break;
       }
-      await page.waitForTimeout(1500);
+      // Event-driven resume: instead of polling the URL every 1.5s, wait for the
+      // StoreWeb URL to appear. waitForURL resolves within milliseconds of the
+      // post-2FA redirect, so the launch fires the instant MFA completes.
+      try { await page.waitForURL(/Citrix\/PRDStoreWeb|Citrix\/StoreWeb/i, { timeout: 1500 }); }
+      catch (_) {}
       continue;
     }
 
     // 6. Citrix StoreWeb reached
     if (url.includes('Citrix/PRDStoreWeb') || url.includes('Citrix/StoreWeb')) {
       if (!citrixReached) {
-        log('SUCCESS: Citrix StoreWeb reached.');
+        log('SUCCESS: Citrix StoreWeb reached — launching ACFC immediately.');
         citrixReached = true;
-        // One-time diagnostic: dump the real launch controls so the exact
-        // selector is known (the ACFC tile opens a detail panel with its own
-        // launch button whose text/class we must click).
-        try {
-          const controls = await page.evaluate(() => {
-            const out = [];
-            document.querySelectorAll('a, button').forEach(e => {
-              const t = (e.textContent || '').trim();
-              const cls = (e.className || '').toString();
-              const href = e.getAttribute('href') || '';
-              const title = e.getAttribute('title') || '';
-              if (/acfc|launch|open|start|connect|desk|storeapp|app-item|tile|ica/i.test(t + ' ' + cls + ' ' + href + ' ' + title)) {
-                out.push({ tag: e.tagName, text: t.slice(0, 40), cls: cls.slice(0, 60), href: href.slice(0, 80), title });
-              }
-            });
-            return out;
-          });
-          log('DIAG StoreWeb controls:', JSON.stringify(controls.slice(0, 25)));
-        } catch (_) {}
       }
 
       // ── Launch ACFC Desktop ────────────────────────────────────────────────
