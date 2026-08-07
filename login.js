@@ -19,33 +19,33 @@ const path = require('path');
 const fs = require('fs');
 const { exec } = require('child_process');
 
-// ── Single-instance guard ────────────────────────────────────────────────
+const PID = process.pid;
+
+// ── Single-instance guard (ATOMIC — no TOCTOU race) ──────────────────────
 // Two concurrent runs share the same user_data profile and race each other's
 // form submissions (one submits an EMPTY password, the other fills ~10s later
-// and submits again). A PID lockfile prevents a second launch from ever doing
-// that: if a live instance is already running, we exit immediately. This makes
-// the empty-first-submit structurally impossible no matter how the script is
-// launched (app double-click, re-added Login Item, etc.).
+// and submits again). The check-then-write pattern has a race window: two
+// launches within the same instant both see "no lock" and both proceed.
+// We use fs.openSync(path, 'wx') — the 'x' makes creation exclusive/atomic at
+// the OS level, so exactly one instance wins the lock; the loser exits. This
+// makes a double-submit structurally impossible no matter how it's launched.
 const LOCKFILE = path.join(__dirname, '.run.lock');
-function instanceAlreadyRunning() {
-  try {
-    const pid = parseInt(fs.readFileSync(LOCKFILE, 'utf8').trim(), 10);
-    if (Number.isNaN(pid)) return false;
-    // kill -0 checks the process exists without signalling it.
-    exec(`kill -0 ${pid}`);
-    return true;
-  } catch (_) {
-    return false; // lockfile missing or process dead -> free to run
+let lockFd = null;
+try {
+  lockFd = fs.openSync(LOCKFILE, 'wx'); // throws EEXIST if already present
+  fs.writeSync(lockFd, String(PID));
+} catch (e) {
+  if (e && e.code === 'EEXIST') {
+    const other = fs.readFileSync(LOCKFILE, 'utf8').trim();
+    console.error(`[citrix][pid=${PID}] Another instance is already running (lock held by pid ${other}) — exiting to avoid a double-submit.`);
+    process.exit(0);
   }
+  console.error(`[citrix][pid=${PID}] WARN: could not acquire lock (${e && e.code}) — continuing.`);
 }
-if (instanceAlreadyRunning()) {
-  console.error('[citrix] Another instance is already running — exiting to avoid a double-submit.');
-  process.exit(0);
-}
-fs.writeFileSync(LOCKFILE, String(process.pid));
-process.on('exit', () => { try { fs.unlinkSync(LOCKFILE); } catch (_) {} });
+process.on('exit', () => { try { if (lockFd !== null) fs.closeSync(lockFd); } catch (_) {} try { fs.unlinkSync(LOCKFILE); } catch (_) {} });
 process.on('SIGINT', () => process.exit(0));
 process.on('SIGTERM', () => process.exit(0));
+console.error(`[citrix][pid=${PID}] === session start, lock acquired (node ${process.version}) ===`);
 require('dotenv').config();
 
 const LOGIN_URL = process.env.WORK_LOGIN_URL || 'https://citrix.amerihealthcaritas.com/Citrix/PRDStoreWeb/';
@@ -59,7 +59,7 @@ if (!USERNAME || !PASSWORD) {
   process.exit(1);
 }
 
-const log = (...a) => console.log('[citrix]', ...a);
+const log = (...a) => console.log('[citrix][pid=' + PID + ']', ...a);
 
 // Safe wait that no-ops if the page/context has already closed (e.g. after the
 // .ica launches and Citrix Workspace takes over the browser).
