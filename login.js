@@ -59,39 +59,42 @@ const log = (...a) => console.log('[citrix]', ...a);
   });
 
   /**
-   * Robust fill for Entra ID / ADFS fields that sometimes ignore Playwright's
-   * `fill()` (custom React handlers). Tries in order:
-   *   1. fill()              — standard
-   *   2. pressSequentially   — char-by-char typing (triggers key handlers)
-   *   3. DOM value setter    — set value + dispatch input/change events
+   * Robust fill for Entra ID / ADFS fields.
+   * Order optimized for speed: Entra's password field only honors a DOM value
+   * injection, so we try that FIRST (instant). Standard fill() and char-by-char
+   * typing are kept only as fallbacks for non-Entra pages.
    * Returns true if the field ends up with the expected value.
    */
   async function fillRobust(locator, value) {
-    await locator.click({ timeout: 3000 }).catch(() => {});
-    await locator.fill(value, { timeout: 3000 }).catch(() => {});
-    let current = '';
-    try { current = await locator.inputValue({ timeout: 2000 }); } catch (_) {}
-    if (current === value) return true;
-
-    // Fallback 1: type char-by-char
+    // Fast path: set value via the native setter + dispatch input/change.
     try {
-      await locator.click({ timeout: 3000 }).catch(() => {});
-      await locator.pressSequentially(value, { delay: 40 });
-      current = await locator.inputValue({ timeout: 2000 }).catch(() => '');
-      if (current === value) return true;
-    } catch (_) {}
-
-    // Fallback 2: force value via DOM + events
-    try {
+      await locator.click({ timeout: 2000 }).catch(() => {});
       await locator.evaluate((el, v) => {
         const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
         setter.call(el, v);
         el.dispatchEvent(new Event('input', { bubbles: true }));
         el.dispatchEvent(new Event('change', { bubbles: true }));
       }, value);
-      current = await locator.inputValue({ timeout: 2000 }).catch(() => '');
+      const current = await locator.inputValue({ timeout: 1500 }).catch(() => '');
+      if (current === value) return true;
     } catch (_) {}
-    return current === value;
+
+    // Fallback 1: standard fill()
+    try {
+      await locator.fill(value, { timeout: 2000 });
+      const current = await locator.inputValue({ timeout: 1500 }).catch(() => '');
+      if (current === value) return true;
+    } catch (_) {}
+
+    // Fallback 2: char-by-char typing
+    try {
+      await locator.click({ timeout: 2000 }).catch(() => {});
+      await locator.pressSequentially(value, { delay: 20 });
+      const current = await locator.inputValue({ timeout: 1500 }).catch(() => '');
+      return current === value;
+    } catch (_) {}
+
+    return false;
   }
 
   function launchCitrix(ica) {
@@ -183,12 +186,6 @@ const log = (...a) => console.log('[citrix]', ...a);
       if (field) {
         const ok = await fillRobust(field, PASSWORD);
         log(ok ? 'Filled password' : 'WARN: password value not confirmed — proceeding');
-        // Re-check: Entra sometimes clears the field; verify then retry once.
-        const verifyVal = await field.inputValue({ timeout: 2000 }).catch(() => '');
-        if (verifyVal !== PASSWORD) {
-          log('Password not retained — retyping...');
-          await fillRobust(field, PASSWORD);
-        }
         const clicked = await clickFirst([
           'input[id="idSIButton9"]', 'button[id="idSIButton9"]',
           'button:has-text("Sign in")', 'button:has-text("Log in")',
