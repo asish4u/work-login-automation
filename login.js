@@ -66,14 +66,21 @@ const log = (...a) => console.log('[citrix]', ...a);
    * Returns true if the field ends up with the expected value.
    */
   async function fillRobust(locator, value) {
-    // Fast path: set value via the native setter + dispatch input/change.
+    // Fast path: React-aware value injection. Entra's password field is a
+    // controlled React input — a plain value set is ignored unless we use the
+    // React-tracked native setter and dispatch a real "input" Event.
     try {
       await locator.click({ timeout: 2000 }).catch(() => {});
       await locator.evaluate((el, v) => {
-        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+        const proto = window.HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
         setter.call(el, v);
+        // React listens for the native "input" Event dispatched on the element.
         el.dispatchEvent(new Event('input', { bubbles: true }));
         el.dispatchEvent(new Event('change', { bubbles: true }));
+        // Also poke selection so React's onChange sees a change.
+        el.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true }));
+        el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
       }, value);
       const current = await locator.inputValue({ timeout: 1500 }).catch(() => '');
       if (current === value) return true;
@@ -175,27 +182,39 @@ const log = (...a) => console.log('[citrix]', ...a);
       }
     }
 
-    // 2. Password — actively wait for the field instead of polling (avoids ~5s/iteration lag)
+    // 2. Password — actively wait for the field, fill only once it's bound,
+    //    and submit ONLY after the value is confirmed retained (Entra rebinds React state).
     if (emailSubmitted && !passwordSubmitted) {
       const passSel = 'input[name="passwd"], input[name="Password"], input[id="i0118"], input[type="password"]';
       let field = null;
       try {
         await page.waitForSelector(passSel, { state: 'visible', timeout: 30000 });
         field = page.locator(passSel).first();
+        // Entra's React field mounts before it's interactive; wait until editable.
+        await field.waitFor({ state: 'editable', timeout: 10000 }).catch(() => {});
       } catch (_) {}
       if (field) {
+        // Fill and confirm the value sticks before we submit (avoids empty-form submit).
+        let ok = false;
+        for (let attempt = 0; attempt < 5 && !ok; attempt++) {
+          ok = await fillRobust(field, PASSWORD);
+          if (!ok) await page.waitForTimeout(800);
+        }
         const t0 = Date.now();
-        const ok = await fillRobust(field, PASSWORD);
-        const dt = Date.now() - t0;
-        log(ok ? `Filled password (${dt}ms)` : `WARN: password value not confirmed after ${dt}ms — proceeding`);
-        const clicked = await clickFirst([
-          'input[id="idSIButton9"]', 'button[id="idSIButton9"]',
-          'button:has-text("Sign in")', 'button:has-text("Log in")',
-          'input[type="submit"]', 'button[type="submit"]'
-        ]);
-        log(clicked ? 'Clicked Sign in' : 'No Sign in — pressing Enter');
-        if (!clicked) {
-          await Promise.all([page.waitForNavigation({ timeout: 15000 }).catch(() => {}), page.keyboard.press('Enter')]);
+        // Re-verify the value is actually present right before submitting.
+        const verifyVal = await field.inputValue({ timeout: 2000 }).catch(() => '');
+        const retained = verifyVal === PASSWORD;
+        log(retained ? `Filled password (${Date.now() - t0}ms, retained)` : `WARN: password not retained (got "${verifyVal}") — submitting anyway`);
+        if (retained) {
+          const clicked = await clickFirst([
+            'input[id="idSIButton9"]', 'button[id="idSIButton9"]',
+            'button:has-text("Sign in")', 'button:has-text("Log in")',
+            'input[type="submit"]', 'button[type="submit"]'
+          ]);
+          log(clicked ? 'Clicked Sign in' : 'No Sign in — pressing Enter');
+          if (!clicked) {
+            await Promise.all([page.waitForNavigation({ timeout: 15000 }).catch(() => {}), page.keyboard.press('Enter')]);
+          }
         }
         passwordSubmitted = true;
         await page.waitForTimeout(4000);
