@@ -17,7 +17,7 @@
 const { firefox } = require('playwright');
 const path = require('path');
 const fs = require('fs');
-const { exec } = require('child_process');
+const { exec, execSync } = require('child_process');
 
 const PID = process.pid;
 
@@ -46,6 +46,21 @@ process.on('exit', () => { try { if (lockFd !== null) fs.closeSync(lockFd); } ca
 process.on('SIGINT', () => process.exit(0));
 process.on('SIGTERM', () => process.exit(0));
 console.error(`[citrix][pid=${PID}] === session start, lock acquired (node ${process.version}) ===`);
+
+// ── Cross-directory duplicate guard ──────────────────────────────────────
+// The per-directory lockfile above blocks a second launch of THIS file. But a
+// second copy launched from a DIFFERENT directory (different lockfile) would
+// slip past it. Scan the process table for any OTHER `node login.js` and exit
+// if one is already alive. (Checked AFTER the lockfile so the lock winner is
+// the one that decides; the window is vanishingly small.)
+try {
+  const out = execSync('pgrep -f "node login.js" 2>/dev/null || true').toString().trim();
+  const pids = out.split('\n').map(s => s.trim()).filter(Boolean).map(Number);
+  if (pids.some(p => p !== PID)) {
+    console.error(`[citrix][pid=${PID}] Another node login.js process is already running (pids: ${pids.filter(p => p !== PID).join(', ')}) — exiting.`);
+    process.exit(0);
+  }
+} catch (_) { /* ignore — if we can't scan, proceed */ }
 require('dotenv').config();
 
 const LOGIN_URL = process.env.WORK_LOGIN_URL || 'https://citrix.amerihealthcaritas.com/Citrix/PRDStoreWeb/';
@@ -180,7 +195,14 @@ async function safeWait(page, ms) {
     const url = page.url();
     log(`[${attempt}] ${url} (t=${T()})`);
 
-    // 1. Email — actively wait for the field instead of polling
+    // 1. Email — fill username, then click Next / Sign in.
+    //    IMPORTANT: Entra sometimes renders a COMBINED email+password page
+    //    where the primary button (idSIButton9) is "Sign in" and submitting it
+    //    with a blank password is exactly the "empty-first-submit" symptom. We
+    //    therefore only click the primary button if there is NO password field
+    //    present on this page (pure email page) OR the password field already
+    //    holds a value. If a blank password field coexists, we fall through to
+    //    step 2 to fill it FIRST, then submit from there.
     if (!emailSubmitted) {
       const emailSel = 'input[name="loginfmt"], input[name="UserName"], input[name="Email"], input[id="i0116"], input[type="email"]';
       let field = null;
@@ -192,6 +214,16 @@ async function safeWait(page, ms) {
       if (field) {
         const ok = await fillRobust(field, USERNAME);
         log(ok ? `Filled username (t=${T()})` : `WARN: username value not confirmed (t=${T()})`);
+        // Is a password field present on this same page?
+        const pwdOnPage = await page.locator('input[type="password"]').first().isVisible({ timeout: 800 }).catch(() => false);
+        if (pwdOnPage) {
+          // Combined page: do NOT click the primary button here. Let step 2 fill
+          // the password and submit it (with the password confirmed). Mark email
+          // done so step 2 can run, but do NOT trigger a submit now.
+          log('email: password field present on same page — deferring submit to password step (t=' + T() + ')');
+          emailSubmitted = true;
+          continue;
+        }
         const clicked = await clickFirst([
           'input[id="idSIButton9"]', 'button[id="idSIButton9"]',
           'button:has-text("Next")', 'button:has-text("Sign in")',
@@ -202,14 +234,14 @@ async function safeWait(page, ms) {
           await Promise.all([page.waitForNavigation({ timeout: 15000 }).catch(() => {}), page.keyboard.press('Enter')]);
         }
         emailSubmitted = true;
-        // No fixed sleep here — waitForSelector in the next iteration handles
-        // password-field readiness without adding padding on top of SSO latency.
         continue;
       }
     }
 
     // 2. Password — wait for the field, fill it (instant via Playwright fill()),
     //    and submit ONLY after the value is confirmed present in the field.
+    //    Forensic: log the button text and the field value at click time so a
+    //    double-submit (or an empty submit) is unmistakable in the log.
     if (emailSubmitted && !passwordSubmitted) {
       const passSel = 'input[name="passwd"], input[name="Password"], input[id="i0118"], input[type="password"]';
       let field = null;
@@ -220,8 +252,7 @@ async function safeWait(page, ms) {
       } catch (_) {}
       if (field) {
         log('password: field ready, filling (t=' + T() + ')');
-        // fillRobust retries internally until the value truly sticks, so by the
-        // time we reach here the field holds PASSWORD (or we give up honestly).
+        // fillRobust retries internally until the value truly sticks.
         let ok = false;
         for (let attempt = 0; attempt < 3 && !ok; attempt++) {
           ok = await fillRobust(field, PASSWORD);
@@ -229,19 +260,23 @@ async function safeWait(page, ms) {
         }
         const verifyVal = await field.inputValue({ timeout: 2000 }).catch(() => '');
         const retained = verifyVal === PASSWORD;
-        log(retained
-          ? `Filled password (retained, t=${T()})`
-          : `WARN: password not retained (got "${verifyVal}") — NOT submitting empty form`);
-        if (retained) {
-          const clicked = await clickFirst([
-            'input[id="idSIButton9"]', 'button[id="idSIButton9"]',
-            'button:has-text("Sign in")', 'button:has-text("Log in")',
-            'input[type="submit"]', 'button[type="submit"]'
-          ]);
-          log(clicked ? 'Clicked Sign in' : 'No Sign in — pressing Enter');
-          if (!clicked) {
-            await Promise.all([page.waitForNavigation({ timeout: 15000 }).catch(() => {}), page.keyboard.press('Enter')]);
-          }
+        if (!retained) {
+          log(`WARN: password not retained (got "${verifyVal}") — NOT submitting empty form (t=${T()})`);
+          passwordSubmitted = true;
+          continue;
+        }
+        // GUARANTEE: read back the value one more time immediately before click.
+        const finalVal = await field.inputValue({ timeout: 2000 }).catch(() => '');
+        log(`Filled password (retained, final="${finalVal.length} chars", t=${T()})`);
+        const clicked = await clickFirst([
+          'input[id="idSIButton9"]', 'button[id="idSIButton9"]',
+          'button:has-text("Sign in")', 'button:has-text("Log in")',
+          'input[type="submit"]', 'button[type="submit"]'
+        ]);
+        const btnText = clicked || '(Enter pressed)';
+        log(`Clicked Sign in [button=${btnText}] with password present (t=${T()})`);
+        if (!clicked) {
+          await Promise.all([page.waitForNavigation({ timeout: 15000 }).catch(() => {}), page.keyboard.press('Enter')]);
         }
         passwordSubmitted = true;
         continue;
