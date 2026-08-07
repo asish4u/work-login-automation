@@ -124,8 +124,8 @@ async function safeWait(page, ms) {
     log('ICA saved to:', icaFilePath);
     if (!icaCaptured) { icaCaptured = true; launchCitrix(icaFilePath); }
   });
-  // Forensics: log EVERY LaunchIca / Resources / .ica response so we can see
-  // Citrix's real launch URL, status, content-type and first bytes.
+  // Single response listener (merged for speed): log status/url/ct once, and
+  // capture the .ica body exactly once when Citrix returns a 200 LaunchIca.
   page.on('response', async (response) => {
     try {
       const url = response.url();
@@ -133,26 +133,13 @@ async function safeWait(page, ms) {
       if (!/launchica|resources|\.ica|application\/x-ica|x-ica/i.test(url + ' ' + ct)) return;
       const status = response.status();
       log('RESP', status, ct, url.slice(0, 100));
-      if (status === 200 && /ica/.test(ct)) {
-        const body = await response.body();
-        log('RESP body first 60 bytes:', JSON.stringify(body.slice(0, 60).toString('utf8')));
-      }
-    } catch (_) {}
-  });
-  // Bulletproof capture: Citrix always issues a LaunchIca HTTP request when the
-  // tile is clicked. A fetch/XHR response does NOT trigger a browser download,
-  // so we intercept the response body directly and write the .ica ourselves.
-  page.on('response', async (response) => {
-    try {
-      const url = response.url();
-      const ct = (response.headers()['content-type'] || '').toLowerCase();
-      if (response.status() !== 200) return;
+      if (status !== 200 || icaCaptured) return;
       if (!/launchica|\.ica|application\/x-ica|x-ica/i.test(url + ' ' + ct)) return;
-      if (icaCaptured) return;
       const body = await response.body();
       if (!body || body.length < 40) return;
       const m = url.match(/LaunchIca\/([^/?#]+)/i);
-      const name = (m ? decodeURIComponent(m[1]) : 'ACFC_Desktop').replace(/[^\w.-]/g, '_') + '.ica';
+      const name = (m ? decodeURIComponent(m[1]) : 'ACFC_Desktop').replace(/[^\w.-]/g, '_');
+      if (!/\.ica$/i.test(name)) name += '.ica';
       log('LaunchIca response intercepted:', url);
       captureAndLaunch(body, name);
     } catch (_) {}
@@ -212,7 +199,7 @@ async function safeWait(page, ms) {
 
   log('Loading StoreWeb...');
   await page.goto(LOGIN_URL, { timeout: 60000, waitUntil: 'domcontentloaded' });
-  await page.waitForTimeout(4000);
+  await page.waitForTimeout(1500);
 
   // State flags
   let emailSubmitted = false;
@@ -377,7 +364,7 @@ async function safeWait(page, ms) {
         log('TIMEOUT: 2FA not completed within 5 minutes. Exiting.');
         break;
       }
-      await page.waitForTimeout(5000);
+      await page.waitForTimeout(1500);
       continue;
     }
 
@@ -448,61 +435,51 @@ async function safeWait(page, ms) {
       // The user confirmed: clicking the tile opens an action MENU; the actual
       // launch happens when the "Run" (or "Open"/"Start") item in that menu is
       // clicked. We dump the menu items first so the exact item is known.
+      // Strategy A: open the ACFC tile's action menu, then click its "Open" item.
+      // We already know (from earlier DOM diagnostics) the item is
+      // `a.appDetails-action-launch` with text "Open". One raw-click on the tile
+      // opens the menu; one in-page evaluate clicks the Run/Open item and returns
+      // what it clicked — a single round-trip, no diagnostic dump round-trip.
       if (!launched) {
-        log('Strategy A: open ACFC action menu');
+        log('Strategy A: open ACFC action menu -> click Open');
         await rawClick('a.storeapp-details-container');
-        await page.waitForTimeout(1500);
-        // Dump the currently-visible menu/launch items.
-        try {
-          const items = await page.evaluate(() => {
-            const out = [];
-            document.querySelectorAll('li, a, button, [role="menuitem"]').forEach(e => {
-              const t = (e.textContent || '').trim();
-              const cls = (e.className || '').toString();
-              if (/run|open|start|connect|launch|desk/i.test(t) && t.length < 30 && e.offsetParent !== null) {
-                out.push({ tag: e.tagName, text: t, cls: cls.slice(0, 50) });
-              }
-            });
-            return out;
-          });
-          log('Action menu items:', JSON.stringify(items));
-          // Click the Run/Open/Start item raw-DOM (first match, visible).
-          const ran = await page.evaluate(() => {
-            const cands = Array.from(document.querySelectorAll('li, a, button, [role="menuitem"]'));
-            const el = cands.find(e =>
-              e.offsetParent !== null &&
-              /^\s*(run|open|start|connect|launch)\s*$/i.test((e.textContent || '').trim()));
-            if (!el) return false;
-            el.click();
-            return (el.textContent || '').trim();
-          }).catch(() => false);
-          log('clicked menu item:', ran);
-        } catch (_) {}
-        if (await waitForIca(10000)) { log('Strategy A launched ICA'); launched = true; }
+        await page.waitForTimeout(600);
+        const ran = await page.evaluate(() => {
+          const cands = Array.from(document.querySelectorAll('li, a, button, [role="menuitem"]'));
+          const el = cands.find(e =>
+            e.offsetParent !== null &&
+            (/^\s*(run|open|start|connect|launch)\s*$/i.test((e.textContent || '').trim()) ||
+             /appDetails-action-launch/i.test(e.className || '')));
+          if (!el) return false;
+          el.click();
+          return (el.textContent || '').trim();
+        }).catch(() => false);
+        log('clicked menu item:', ran);
+        if (await waitForIca(6000)) { log('Strategy A launched ICA'); launched = true; }
       }
 
       // Strategy B: click the "Open" detail button directly if present.
       if (!launched) {
         log('Strategy B: click Open detail button');
         await rawClick('a.appInfoOpen');
-        if (await waitForIca(10000)) { log('Strategy B launched ICA'); launched = true; }
+        if (await waitForIca(6000)) { log('Strategy B launched ICA'); launched = true; }
       }
 
       // Strategy C: JS fallback — generic ACFC control raw-click + menu scan.
       if (!launched) {
         log('Strategy C: JS fallback raw-click + Run menu');
         await rawClick(null);
-        await page.waitForTimeout(1500);
+        await page.waitForTimeout(600);
         await page.evaluate(() => {
           const cands = Array.from(document.querySelectorAll('li, a, button, [role="menuitem"]'));
           const el = cands.find(e => e.offsetParent !== null && /^\s*(run|open|start|connect|launch)\s*$/i.test((e.textContent || '').trim()));
           if (el) el.click();
         }).catch(() => {});
-        if (await waitForIca(10000)) { log('Strategy C launched ICA'); launched = true; }
+        if (await waitForIca(6000)) { log('Strategy C launched ICA'); launched = true; }
       }
 
       if (icaCaptured) { log('DONE: ICA launched. Exiting.'); break; }
-      if (!launched) { log('Waiting for ACFC Desktop to appear...'); await page.waitForTimeout(8000); }
+      if (!launched) { log('Waiting for ACFC Desktop to appear...'); await page.waitForTimeout(4000); }
       continue;
     }
 
