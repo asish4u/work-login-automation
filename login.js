@@ -149,14 +149,14 @@ const log = (...a) => console.log('[citrix]', ...a);
     const url = page.url();
     log(`[${attempt}] ${url}`);
 
-    // 1. Email
+    // 1. Email — actively wait for the field instead of polling
     if (!emailSubmitted) {
-      const emailSel = ['input[name="loginfmt"]', 'input[name="UserName"]', 'input[name="Email"]', 'input[id="i0116"]', 'input[type="email"]'];
+      const emailSel = 'input[name="loginfmt"], input[name="UserName"], input[name="Email"], input[id="i0116"], input[type="email"]';
       let field = null;
-      for (const s of emailSel) {
-        const el = page.locator(s).first();
-        if (await el.isEnabled({ timeout: 800 }).catch(() => false)) { field = el; break; }
-      }
+      try {
+        await page.waitForSelector(emailSel, { state: 'visible', timeout: 30000 });
+        field = page.locator(emailSel).first();
+      } catch (_) {}
       if (field) {
         const ok = await fillRobust(field, USERNAME);
         log(ok ? 'Filled username' : 'WARN: username value not confirmed — proceeding');
@@ -175,14 +175,14 @@ const log = (...a) => console.log('[citrix]', ...a);
       }
     }
 
-    // 2. Password
+    // 2. Password — actively wait for the field instead of polling (avoids ~5s/iteration lag)
     if (emailSubmitted && !passwordSubmitted) {
-      const passSel = ['input[name="passwd"]', 'input[name="Password"]', 'input[id="i0118"]', 'input[type="password"]'];
+      const passSel = 'input[name="passwd"], input[name="Password"], input[id="i0118"], input[type="password"]';
       let field = null;
-      for (const s of passSel) {
-        const el = page.locator(s).first();
-        if (await el.isEnabled({ timeout: 800 }).catch(() => false)) { field = el; break; }
-      }
+      try {
+        await page.waitForSelector(passSel, { state: 'visible', timeout: 30000 });
+        field = page.locator(passSel).first();
+      } catch (_) {}
       if (field) {
         const t0 = Date.now();
         const ok = await fillRobust(field, PASSWORD);
