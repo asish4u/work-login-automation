@@ -18,7 +18,7 @@ detection.
 ## What the automation does (step-by-step)
 
 1. Opens `https://citrix.amerihealthcaritas.com/Citrix/PRDStoreWeb/`
-2. **Username page** → types `anayak1@amerihealthcaritas.com` → clicks **Next**
+2. **Username page** → types `your_email@domain.com` → clicks **Next**
 3. **Password page** → types the password (robust fill that falls back to
    char-by-char typing + DOM value injection if the field ignores `fill()`) →
    clicks **Sign in**

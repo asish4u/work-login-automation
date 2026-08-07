@@ -4,7 +4,7 @@
  *
  * Flow (matches the documented manual process):
  *   1. Open https://citrix.amerihealthcaritas.com/Citrix/PRDStoreWeb/
- *   2. Username page  -> fill anayak1@amerihealthcaritas.com -> Next
+ *   2. Username page  -> fill your_email@domain.com -> Next
  *   3. Password page  -> fill password -> Sign in
  *   4. Verification page -> click "Continue"
  *   5. 2FA page -> WAIT (human types the code in the browser)
