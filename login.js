@@ -184,8 +184,10 @@ const log = (...a) => console.log('[citrix]', ...a);
         if (await el.isEnabled({ timeout: 800 }).catch(() => false)) { field = el; break; }
       }
       if (field) {
+        const t0 = Date.now();
         const ok = await fillRobust(field, PASSWORD);
-        log(ok ? 'Filled password' : 'WARN: password value not confirmed — proceeding');
+        const dt = Date.now() - t0;
+        log(ok ? `Filled password (${dt}ms)` : `WARN: password value not confirmed after ${dt}ms — proceeding`);
         const clicked = await clickFirst([
           'input[id="idSIButton9"]', 'button[id="idSIButton9"]',
           'button:has-text("Sign in")', 'button:has-text("Log in")',
