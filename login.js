@@ -1,22 +1,41 @@
 #!/usr/bin/env node
+/**
+ * Citrix Work Login Automation — canonical script
+ *
+ * Flow (matches the documented manual process):
+ *   1. Open https://citrix.amerihealthcaritas.com/Citrix/PRDStoreWeb/
+ *   2. Username page  -> fill anayak1@amerihealthcaritas.com -> Next
+ *   3. Password page  -> fill password -> Sign in
+ *   4. Verification page -> click "Continue"
+ *   5. 2FA page -> WAIT (human types the code in the browser)
+ *   6. Citrix StoreWeb -> click & download "ACFC Desktop" -> run .ica via Citrix Workspace
+ *
+ * Credentials are read from .env (WORK_USERNAME / WORK_PASSWORD / WORK_LOGIN_URL).
+ * Secrets are never hardcoded and never committed.
+ */
+
 const { firefox } = require('playwright');
 const path = require('path');
-const { exec } = require('child_process');
 const fs = require('fs');
+const { exec } = require('child_process');
 require('dotenv').config();
 
 const LOGIN_URL = process.env.WORK_LOGIN_URL || 'https://citrix.amerihealthcaritas.com/Citrix/PRDStoreWeb/';
 const USERNAME = process.env.WORK_USERNAME;
 const PASSWORD = process.env.WORK_PASSWORD;
+const DOWNLOAD_DIR = process.env.HOME + '/Downloads';
+const MFA_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes to complete 2FA manually
 
 if (!USERNAME || !PASSWORD) {
-  console.error('ERROR: Set WORK_USERNAME and WORK_PASSWORD in .env');
+  console.error('ERROR: Set WORK_USERNAME and WORK_PASSWORD in .env (see .env.example).');
   process.exit(1);
 }
 
-console.log('Starting login automation...');
+const log = (...a) => console.log('[citrix]', ...a);
 
 (async () => {
+  log('Starting login automation for', USERNAME);
+
   const userDataDir = path.join(__dirname, 'user_data');
   const context = await firefox.launchPersistentContext(userDataDir, {
     headless: false,
@@ -31,312 +50,282 @@ console.log('Starting login automation...');
   let icaFilePath = null;
   context.on('download', async (download) => {
     const suggested = download.suggestedFilename();
-    if (suggested.endsWith('.ica') || suggested.endsWith('.ics')) {
-      console.log('\n[DOWNLOAD] File download started: ' + suggested);
-      icaFilePath = path.join('/Users/nayak/Downloads', suggested);
-      await download.saveAs(icaFilePath);
-      console.log('[DOWNLOAD] File saved to: ' + icaFilePath);
-      const workspacePaths = ['/Applications/Citrix Workspace.app', '/Applications/Citrix Receiver.app'];
-      for (const appPath of workspacePaths) {
-        if (fs.existsSync(appPath)) {
-          console.log('[LAUNCH] Launching Citrix with: ' + appPath);
-          exec('open "' + appPath + '" "' + icaFilePath + '"', (err) => {
-            if (err) console.log('Launch error:', err.message);
-            else console.log('[LAUNCH] Citrix session launched!');
-          });
-          return;
-        }
-      }
-      console.log('[WARN] Citrix Workspace/Receiver not found. Please launch manually.');
-    }
+    if (!suggested.toLowerCase().endsWith('.ica')) return;
+    log('ICA download started:', suggested);
+    icaFilePath = path.join(DOWNLOAD_DIR, suggested);
+    await download.saveAs(icaFilePath);
+    log('ICA saved to:', icaFilePath);
+    launchCitrix(icaFilePath);
   });
 
-  console.log('Loading Citrix...');
-  await page.goto(LOGIN_URL, { timeout: 60000, waitUntil: 'domcontentloaded' });
-  await page.waitForTimeout(5000);
+  /**
+   * Robust fill for Entra ID / ADFS fields that sometimes ignore Playwright's
+   * `fill()` (custom React handlers). Tries in order:
+   *   1. fill()              — standard
+   *   2. pressSequentially   — char-by-char typing (triggers key handlers)
+   *   3. DOM value setter    — set value + dispatch input/change events
+   * Returns true if the field ends up with the expected value.
+   */
+  async function fillRobust(locator, value) {
+    await locator.click({ timeout: 3000 }).catch(() => {});
+    await locator.fill(value, { timeout: 3000 }).catch(() => {});
+    let current = '';
+    try { current = await locator.inputValue({ timeout: 2000 }); } catch (_) {}
+    if (current === value) return true;
 
-  // State tracking - uses separate flags for each step
-  let emailFilled = false;      // email field has been filled
-  let emailSubmitted = false;   // email form submitted (Next clicked)
-  let passwordFilled = false;
+    // Fallback 1: type char-by-char
+    try {
+      await locator.click({ timeout: 3000 }).catch(() => {});
+      await locator.pressSequentially(value, { delay: 40 });
+      current = await locator.inputValue({ timeout: 2000 }).catch(() => '');
+      if (current === value) return true;
+    } catch (_) {}
+
+    // Fallback 2: force value via DOM + events
+    try {
+      await locator.evaluate((el, v) => {
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+        setter.call(el, v);
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      }, value);
+      current = await locator.inputValue({ timeout: 2000 }).catch(() => '');
+    } catch (_) {}
+    return current === value;
+  }
+
+  function launchCitrix(ica) {
+    const candidates = [
+      '/Applications/Citrix Workspace.app',
+      '/Applications/Citrix Receiver.app'
+    ];
+    for (const app of candidates) {
+      if (fs.existsSync(app)) {
+        log('Launching Citrix with', app);
+        exec(`open "${app}" "${ica}"`, (err) => {
+          if (err) log('Launch error:', err.message);
+          else log('Citrix Workspace session launched!');
+        });
+        return;
+      }
+    }
+    log('WARN: Citrix Workspace/Receiver not found. Open the .ica manually:', ica);
+  }
+
+  log('Loading StoreWeb...');
+  await page.goto(LOGIN_URL, { timeout: 60000, waitUntil: 'domcontentloaded' });
+  await page.waitForTimeout(4000);
+
+  // State flags
+  let emailSubmitted = false;
   let passwordSubmitted = false;
+  let continued = false;
   let mfaCompleted = false;
   let citrixReached = false;
+  const mfaStart = Date.now();
 
-  for (let attempt = 0; attempt < 120; attempt++) {
-    await page.waitForTimeout(2000);
+  const clickFirst = async (selectors, { nav = true } = {}) => {
+    for (const sel of selectors) {
+      const el = page.locator(sel).first();
+      if (await el.isEnabled({ timeout: 1500 }).catch(() => false)) {
+        if (nav) {
+          await Promise.all([
+            page.waitForNavigation({ timeout: 15000 }).catch(() => {}),
+            el.click()
+          ]);
+        } else {
+          await el.click();
+        }
+        return sel;
+      }
+    }
+    return null;
+  };
+
+  for (let attempt = 0; attempt < 180; attempt++) {
     const url = page.url();
-    console.log('\n[' + attempt + '] URL: ' + url);
+    log(`[${attempt}] ${url}`);
 
-    // 1. Email page (SAML/ADFS/Microsoft) - fill username
-    // Wait for navigation after submitting before checking password page
+    // 1. Email
     if (!emailSubmitted) {
-      const emailSelectors = [
-        'input[name="loginfmt"]',
-        'input[name="UserName"]',
-        'input[name="Email"]',
-        'input[id="i0116"]',
-        'input[type="email"]'
-      ];
-      let emailField = null;
-      for (const selector of emailSelectors) {
-        const input = page.locator(selector).first();
-        if (await input.isEnabled({ timeout: 1000 }).catch(() => false)) {
-          emailField = input;
-          break;
-        }
+      const emailSel = ['input[name="loginfmt"]', 'input[name="UserName"]', 'input[name="Email"]', 'input[id="i0116"]', 'input[type="email"]'];
+      let field = null;
+      for (const s of emailSel) {
+        const el = page.locator(s).first();
+        if (await el.isEnabled({ timeout: 800 }).catch(() => false)) { field = el; break; }
       }
-      if (emailField) {
-        if (!emailFilled) {
-          console.log('[STEP] Email page detected, filling username...');
-          await emailField.fill(USERNAME);
-          emailFilled = true;
-          // small wait for any JS validation
-          await page.waitForTimeout(500);
-        }
-        // Click "Next" button (Microsoft: idSIButton9; ADFS: submit button)
-        const nextSelectors = [
-          'input[id="idSIButton9"]',
-          'button[id="idSIButton9"]',
-          'button:has-text("Next")',
-          'button:has-text("Sign in")',
-          'input[type="submit"]',
-          'button[type="submit"]'
-        ];
-        let nextBtn = null;
-        for (const selector of nextSelectors) {
-          const btn = page.locator(selector).first();
-          if (await btn.isEnabled({ timeout: 2000 }).catch(() => false)) {
-            nextBtn = btn;
-            break;
-          }
-        }
-        if (nextBtn) {
-          console.log('[STEP] Clicking Next/Sign in...');
-          await Promise.all([
-            page.waitForNavigation({ timeout: 15000 }).catch(() => {}),
-            nextBtn.click()
-          ]);
-          emailSubmitted = true;
-          await page.waitForTimeout(3000);
-          continue;
-        } else {
-          // Fallback: press Enter
-          console.log('[STEP] No Next button, pressing Enter...');
-          await Promise.all([
-            page.waitForNavigation({ timeout: 15000 }).catch(() => {}),
-            page.keyboard.press('Enter')
-          ]);
-          emailSubmitted = true;
-          await page.waitForTimeout(3000);
-          continue;
-        }
-      }
-      // Email field not visible yet, loop and wait
-    }
-
-    // 2. Password page - fill password (after email submitted)
-    if (emailSubmitted && !passwordSubmitted) {
-      const passSelectors = [
-        'input[name="passwd"]',
-        'input[name="Password"]',
-        'input[id="i0118"]',
-        'input[type="password"]'
-      ];
-      let passField = null;
-      for (const selector of passSelectors) {
-        const input = page.locator(selector).first();
-        if (await input.isEnabled({ timeout: 1000 }).catch(() => false)) {
-          passField = input;
-          break;
-        }
-      }
-      if (passField) {
-        if (!passwordFilled) {
-          console.log('[STEP] Password page detected, filling password...');
-          await passField.fill(PASSWORD);
-          passwordFilled = true;
-          await page.waitForTimeout(500);
-        }
-        // Click "Sign in" button (Microsoft: idSIButton9 reused)
-        const signInSelectors = [
-          'input[id="idSIButton9"]',
-          'button[id="idSIButton9"]',
-          'button:has-text("Sign in")',
-          'button:has-text("Log in")',
-          'input[type="submit"]',
-          'button[type="submit"]'
-        ];
-        let signInBtn = null;
-        for (const selector of signInSelectors) {
-          const btn = page.locator(selector).first();
-          if (await btn.isEnabled({ timeout: 2000 }).catch(() => false)) {
-            signInBtn = btn;
-            break;
-          }
-        }
-        if (signInBtn) {
-          console.log('[STEP] Clicking Sign in...');
-          await Promise.all([
-            page.waitForNavigation({ timeout: 15000 }).catch(() => {}),
-            signInBtn.click()
-          ]);
-          passwordSubmitted = true;
-          await page.waitForTimeout(5000);
-          continue;
-        } else {
-          console.log('[STEP] No Sign in button, pressing Enter...');
-          await Promise.all([
-            page.waitForNavigation({ timeout: 15000 }).catch(() => {}),
-            page.keyboard.press('Enter')
-          ]);
-          passwordSubmitted = true;
-          await page.waitForTimeout(5000);
-          continue;
-        }
-      }
-      // Password not visible yet; maybe still loading. Wait.
-    }
-
-    // 3. "Stay signed in" page - ONLY after password submitted
-    if (passwordSubmitted) {
-      const staySelectors = [
-        'input[id="idSIButton9"]',
-        'button[id="idSIButton9"]',
-        'button:has-text("Yes")',
-        'button:has-text("Stay signed in")'
-      ];
-      let stayField = null;
-      for (const selector of staySelectors) {
-        const btn = page.locator(selector).first();
-        if (await btn.isEnabled({ timeout: 1000 }).catch(() => false)) {
-          // Avoid matching the sign-in button: ensure page is the KMSI page
-          stayField = btn;
-          break;
-        }
-      }
-      // Only click if there's NO password field (i.e., truly a "stay signed in" page)
-      const hasPasswordField = await page.locator('input[type="password"]').first().isVisible({ timeout: 500 }).catch(() => false);
-      if (stayField && !hasPasswordField) {
-        console.log('[STEP] Stay signed in page, clicking Yes...');
-        await Promise.all([
-          page.waitForNavigation({ timeout: 15000 }).catch(() => {}),
-          stayField.click()
+      if (field) {
+        const ok = await fillRobust(field, USERNAME);
+        log(ok ? 'Filled username' : 'WARN: username value not confirmed — proceeding');
+        const clicked = await clickFirst([
+          'input[id="idSIButton9"]', 'button[id="idSIButton9"]',
+          'button:has-text("Next")', 'button:has-text("Sign in")',
+          'input[type="submit"]', 'button[type="submit"]'
         ]);
+        log(clicked ? 'Clicked Next' : 'No Next — pressing Enter');
+        if (!clicked) {
+          await Promise.all([page.waitForNavigation({ timeout: 15000 }).catch(() => {}), page.keyboard.press('Enter')]);
+        }
+        emailSubmitted = true;
         await page.waitForTimeout(3000);
         continue;
       }
     }
 
-    // 4. MFA/Verification page - manual intervention
-    const mfaIndicators = ['mfa', 'verification', 'authmethod', 'MFAREQUIRED', 'factor', 'challenge'];
-    const isMfaPage = mfaIndicators.some(indicator => url.includes(indicator));
-    if (isMfaPage && !mfaCompleted) {
-      console.log('\n[MFA] =====================================');
-      console.log('   MFA/Verification page detected');
-      console.log('   Complete MFA in browser (phone/app)');
-      console.log('   =====================================\n');
-      mfaCompleted = true;
+    // 2. Password
+    if (emailSubmitted && !passwordSubmitted) {
+      const passSel = ['input[name="passwd"]', 'input[name="Password"]', 'input[id="i0118"]', 'input[type="password"]'];
+      let field = null;
+      for (const s of passSel) {
+        const el = page.locator(s).first();
+        if (await el.isEnabled({ timeout: 800 }).catch(() => false)) { field = el; break; }
+      }
+      if (field) {
+        const ok = await fillRobust(field, PASSWORD);
+        log(ok ? 'Filled password' : 'WARN: password value not confirmed — proceeding');
+        // Re-check: Entra sometimes clears the field; verify then retry once.
+        const verifyVal = await field.inputValue({ timeout: 2000 }).catch(() => '');
+        if (verifyVal !== PASSWORD) {
+          log('Password not retained — retyping...');
+          await fillRobust(field, PASSWORD);
+        }
+        const clicked = await clickFirst([
+          'input[id="idSIButton9"]', 'button[id="idSIButton9"]',
+          'button:has-text("Sign in")', 'button:has-text("Log in")',
+          'input[type="submit"]', 'button[type="submit"]'
+        ]);
+        log(clicked ? 'Clicked Sign in' : 'No Sign in — pressing Enter');
+        if (!clicked) {
+          await Promise.all([page.waitForNavigation({ timeout: 15000 }).catch(() => {}), page.keyboard.press('Enter')]);
+        }
+        passwordSubmitted = true;
+        await page.waitForTimeout(4000);
+        continue;
+      }
     }
-    if (isMfaPage) {
+
+    // 3. "Stay signed in?" (only when no password field present)
+    if (passwordSubmitted && !mfaCompleted) {
+      const hasPwd = await page.locator('input[type="password"]').first().isVisible({ timeout: 500 }).catch(() => false);
+      if (!hasPwd) {
+        const clicked = await clickFirst([
+          'input[id="idSIButton9"]', 'button[id="idSIButton9"]',
+          'button:has-text("Yes")', 'button:has-text("Stay signed in")'
+        ]);
+        if (clicked) { log('Clicked Stay-signed-in =', clicked); await page.waitForTimeout(2000); continue; }
+      }
+    }
+
+    // 4. Verification page -> click "Continue"
+    const verifyIndicators = ['verification', 'proofup', 'mfa', 'authmethod', 'securityverification', 'factor', 'challenge'];
+    const isVerify = verifyIndicators.some(i => url.toLowerCase().includes(i));
+    if (isVerify && !continued) {
+      log('Verification page detected — looking for "Continue"...');
+      const clicked = await clickFirst([
+        'button:has-text("Continue")', 'a:has-text("Continue")',
+        'input[type="submit"]', 'button[type="submit"]'
+      ], { nav: false });
+      if (clicked) { log('Clicked Continue ->', clicked); continued = true; await page.waitForTimeout(3000); continue; }
+    }
+
+    // 5. 2FA — manual. Wait for human to enter code and land on StoreWeb.
+    if (isVerify || url.toLowerCase().includes('mfa')) {
+      if (!mfaCompleted) {
+        log('');
+        log('=== 2FA REQUIRED ===');
+        log('Please enter your authentication code in the browser window.');
+        log('Automation will resume automatically once Citrix StoreWeb loads.');
+        log('');
+        mfaCompleted = true;
+      }
+      if (Date.now() - mfaStart > MFA_TIMEOUT_MS) {
+        log('TIMEOUT: 2FA not completed within 5 minutes. Exiting.');
+        break;
+      }
       await page.waitForTimeout(5000);
       continue;
     }
 
-    // 5. Citrix LogonPoint page (tmindex.html) - may need click
-    if (url.includes('LogonPoint/tmindex.html')) {
-      console.log('[STEP] Citrix tmindex.html - looking for login button...');
-      const loginBtn = page.locator('button:has-text("Log On"), button:has-text("Login"), button:has-text("Sign In"), a:has-text("Log On"), input[type="submit"], [href*="saml"]').first();
-      if (await loginBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
-        console.log('Clicking login button...');
-        await loginBtn.click();
-        await page.waitForTimeout(5000);
-      }
-      continue;
-    }
-
-    // 6. Citrix StoreWeb - success, look for ACFC Desktop
+    // 6. Citrix StoreWeb reached
     if (url.includes('Citrix/PRDStoreWeb') || url.includes('Citrix/StoreWeb')) {
-      if (!citrixReached) {
-        console.log('\n[SUCCESS] Citrix StoreWeb reached!');
-        citrixReached = true;
-      }
-      console.log('[STEP] Looking for ACFC Desktop to launch...');
+      if (!citrixReached) { log('SUCCESS: Citrix StoreWeb reached.'); citrixReached = true; }
 
+      // Launch ACFC Desktop (downloads the .ica which auto-opens Citrix Workspace)
       const appSelectors = [
-        'text="ACFC Desktop"',
-        'text="ACFC"',
-        'text="Desktop"',
-        '[data-app-name*="ACFC" i]',
-        '[data-app-name*="Desktop" i]',
-        '.app-item:has-text("ACFC")',
-        '.app-item:has-text("Desktop")',
-        'button:has-text("ACFC Desktop")',
-        'a:has-text("ACFC Desktop")',
-        '.store-app-icon:has-text("Desktop")'
+        'text="ACFC Desktop"', 'a:has-text("ACFC Desktop")', 'button:has-text("ACFC Desktop")',
+        '[data-app-name*="ACFC" i]', '.app-item:has-text("ACFC")', '.store-app-icon:has-text("Desktop")'
       ];
-
       let launched = false;
-      for (const selector of appSelectors) {
+
+      // Strategy 1: click the *clickable* element that contains the ACFC text.
+      for (const sel of appSelectors) {
         try {
-          const app = page.locator(selector).first();
-          if (await app.isVisible({ timeout: 2000 }).catch(() => false)) {
-            console.log('Found app: ' + selector);
-            const [download] = await Promise.all([
-              page.waitForEvent('download', { timeout: 30000 }),
-              app.click()
-            ]);
+          const el = page.locator(sel).first();
+          if (await el.isVisible({ timeout: 2000 }).catch(() => false)) {
+            log('Found ACFC Desktop via', sel);
+            // Prefer the nearest ancestor that actually handles the click
+            // (the text node alone often isn't the launch handler).
+            const clickable = el.locator('xpath=ancestor::a | xpath=ancestor::button | xpath=ancestor::*[contains(@class,"storeapp")] | xpath=ancestor::*[contains(@class,"app")]').last();
+            const target = (await clickable.count()) ? clickable : el;
+            await Promise.all([page.waitForEvent('download', { timeout: 30000 }).catch(() => {}), target.click({ timeout: 5000 }).catch(() => el.click())]);
             launched = true;
             break;
           }
-        } catch (e) { }
+        } catch (_) {}
       }
 
-      // Fallback: click any Launch button
+      // Strategy 2: explicit Launch/Open buttons anywhere on the page.
       if (!launched) {
-        const launchBtns = [
-          'button:has-text("Launch")',
-          'button:has-text("Open")',
-          '[data-automation="launch-button"]',
-          'button[title*="Launch" i]',
-          '.launch-button',
-          'button:has-text("Desktop")',
-          '.app-card button',
-          '.store-app-icon button'
-        ];
-        for (const selector of launchBtns) {
+        for (const sel of ['button:has-text("Launch")', 'button:has-text("Open")', '.launch-button', 'button[title*="Launch" i]']) {
           try {
-            const btn = page.locator(selector).first();
-            if (await btn.isVisible({ timeout: 2000 }).catch(() => false)) {
-              console.log('Clicking launch button: ' + selector);
-              const [download] = await Promise.all([
-                page.waitForEvent('download', { timeout: 30000 }),
-                btn.click()
-              ]);
+            const el = page.locator(sel).first();
+            if (await el.isVisible({ timeout: 2000 }).catch(() => false)) {
+              log('Clicking launch button', sel);
+              await Promise.all([page.waitForEvent('download', { timeout: 30000 }).catch(() => {}), el.click()]);
               launched = true;
               break;
             }
-          } catch (e) { }
+          } catch (_) {}
         }
       }
 
+      // Strategy 3: JS fallback — locate the ACFC Desktop tile and click it.
       if (!launched) {
-        console.log('[WAIT] No app clicked, waiting for any download...');
-        await page.waitForTimeout(10000);
+        try {
+          log('JS fallback: locating ACFC Desktop tile...');
+          const found = await page.evaluate(() => {
+            const nodes = Array.from(document.querySelectorAll('*'));
+            const tile = nodes.find(n => /ACFC\s*Desktop/i.test(n.textContent || '') && n.children.length <= 3);
+            if (!tile) return false;
+            // Walk up to the clickable container
+            let el = tile;
+            while (el && !(el.tagName === 'A' || el.tagName === 'BUTTON' || /storeapp|app-?item|launch/i.test(el.className || ''))) {
+              el = el.parentElement;
+            }
+            (el || tile).click();
+            return true;
+          });
+          if (found) {
+            await page.waitForEvent('download', { timeout: 30000 }).catch(() => {});
+            log('JS fallback triggered launch');
+            launched = true;
+          }
+        } catch (_) {}
       }
 
-      if (icaFilePath) {
-        await page.waitForTimeout(3000);
-        console.log('\n[DONE] Automation complete!');
-        break;
-      }
+      if (icaFilePath) { log('DONE: ICA launched. Exiting.'); break; }
+      if (!launched) { log('Waiting for ACFC Desktop to appear...'); await page.waitForTimeout(8000); }
       continue;
     }
 
-    console.log('[WAIT] Waiting...');
+    await page.waitForTimeout(2000);
   }
 
-  console.log('\n--- Final URL:', page.url());
+  log('Final URL:', page.url());
   await page.waitForTimeout(2000);
   await context.close();
-})();
+  log('Browser closed.');
+})().catch((err) => {
+  console.error('FATAL:', err);
+  process.exit(1);
+});

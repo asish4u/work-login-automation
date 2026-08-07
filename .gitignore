@@ -1,3 +1,24 @@
 node_modules/
 .env
 user_data/
+.DS_Store
+CitrixLogin.command
+SESSION_README.md
+*.log
+pi-session-*.html
+debug_*/
+*_backup.js
+# Generated/experimental scripts (keep canonical login.js only)
+bulletproof_citrix_automation.js
+debug_citrix_automation.js
+debug_login.js
+debug_saml.js
+direct_ica_automation.js
+final_citrix_automation.js
+final_working_automation.js
+login_debug.js
+login_full.js
+login_improved.js
+login_improved.js.backup
+perfect_citrix_automation.js
+ultimate_citrix_automation.js

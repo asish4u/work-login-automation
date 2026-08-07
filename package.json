@@ -1,7 +1,7 @@
 {
   "name": "work-login-automation",
-  "version": "1.1.0",
-  "description": "Secure work login automation using Playwright Firefox",
+  "version": "1.2.0",
+  "description": "Automated Citrix StoreWeb login (username → password → 2FA pause → ACFC Desktop launch) using Playwright Firefox",
   "main": "login.js",
   "scripts": {
     "login": "node login.js"
