@@ -47,6 +47,7 @@ process.on('exit', () => { try { if (lockFd !== null) fs.closeSync(lockFd); } ca
 process.on('SIGINT', () => process.exit(0));
 process.on('SIGTERM', () => process.exit(0));
 console.error(`[citrix][pid=${PID}] === session start, lock acquired (node ${process.version}) ===`);
+console.error(`[citrix][pid=${PID}] debug log: ${DEBUG_LOG}`);
 
 // ── Cross-directory duplicate guard ──────────────────────────────────────
 // The per-directory lockfile above blocks a second launch of THIS file. But a
