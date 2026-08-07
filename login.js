@@ -62,45 +62,39 @@ const log = (...a) => console.log('[citrix]', ...a);
 
   /**
    * Robust fill for Entra ID / ADFS fields.
-   * Order optimized for speed: Entra's password field only honors a DOM value
-   * injection, so we try that FIRST (instant). Standard fill() and char-by-char
-   * typing are kept only as fallbacks for non-Entra pages.
-   * Returns true if the field ends up with the expected value.
+   *
+   * CRITICAL: Entra password/username fields are React-controlled inputs. A raw
+   * DOM value injection sets el.value but React's internal state can stay EMPTY,
+   * so a subsequent "Sign in" submit reads no password and the form bounces —
+   * which is exactly the "submits empty, then fills ~15s later" symptom.
+   *
+   * So we fill with REAL keystrokes first (React always registers these), which
+   * makes the inputValue() confirmation trustworthy. DOM injection is kept only
+   * as a last-resort fallback for non-React pages.
+   * Returns true only if the field ends up holding the value.
    */
   async function fillRobust(locator, value) {
-    // Fast path: React-aware value injection. Entra's password field is a
-    // controlled React input — a plain value set is ignored unless we use the
-    // React-tracked native setter and dispatch a real "input" Event.
+    // Primary: real keystroke simulation. React registers these natively,
+    // so inputValue() afterward is a reliable confirmation.
+    try {
+      await locator.click({ timeout: 2000 }).catch(() => {});
+      await locator.fill('', { timeout: 1500 }).catch(() => {});
+      await locator.pressSequentially(value, { delay: 25 });
+      const current = await locator.inputValue({ timeout: 1500 }).catch(() => '');
+      if (current === value) return true;
+    } catch (_) {}
+
+    // Fallback: DOM value injection (may not register in React state).
     try {
       await locator.click({ timeout: 2000 }).catch(() => {});
       await locator.evaluate((el, v) => {
-        const proto = window.HTMLInputElement.prototype;
-        const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
         setter.call(el, v);
-        // React listens for the native "input" Event dispatched on the element.
         el.dispatchEvent(new Event('input', { bubbles: true }));
         el.dispatchEvent(new Event('change', { bubbles: true }));
-        // Also poke selection so React's onChange sees a change.
-        el.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true }));
-        el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
       }, value);
       const current = await locator.inputValue({ timeout: 1500 }).catch(() => '');
       if (current === value) return true;
-    } catch (_) {}
-
-    // Fallback 1: standard fill()
-    try {
-      await locator.fill(value, { timeout: 2000 });
-      const current = await locator.inputValue({ timeout: 1500 }).catch(() => '');
-      if (current === value) return true;
-    } catch (_) {}
-
-    // Fallback 2: char-by-char typing
-    try {
-      await locator.click({ timeout: 2000 }).catch(() => {});
-      await locator.pressSequentially(value, { delay: 20 });
-      const current = await locator.inputValue({ timeout: 1500 }).catch(() => '');
-      return current === value;
     } catch (_) {}
 
     return false;
