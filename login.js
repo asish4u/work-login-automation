@@ -34,7 +34,9 @@ if (!USERNAME || !PASSWORD) {
 const log = (...a) => console.log('[citrix]', ...a);
 
 (async () => {
-  log('Starting login automation for', USERNAME);
+  const T0 = Date.now();
+  const T = () => ((Date.now() - T0) / 1000).toFixed(1) + 's';
+  log('Starting login automation for', USERNAME, `(t=${T()})`);
 
   const userDataDir = path.join(__dirname, 'user_data');
   const context = await firefox.launchPersistentContext(userDataDir, {
@@ -154,19 +156,20 @@ const log = (...a) => console.log('[citrix]', ...a);
 
   for (let attempt = 0; attempt < 180; attempt++) {
     const url = page.url();
-    log(`[${attempt}] ${url}`);
+    log(`[${attempt}] ${url} (t=${T()})`);
 
     // 1. Email — actively wait for the field instead of polling
     if (!emailSubmitted) {
       const emailSel = 'input[name="loginfmt"], input[name="UserName"], input[name="Email"], input[id="i0116"], input[type="email"]';
       let field = null;
       try {
+        log('email: waiting for field (t=' + T() + ')');
         await page.waitForSelector(emailSel, { state: 'visible', timeout: 30000 });
         field = page.locator(emailSel).first();
       } catch (_) {}
       if (field) {
         const ok = await fillRobust(field, USERNAME);
-        log(ok ? 'Filled username' : 'WARN: username value not confirmed — proceeding');
+        log(ok ? `Filled username (t=${T()})` : `WARN: username value not confirmed (t=${T()})`);
         const clicked = await clickFirst([
           'input[id="idSIButton9"]', 'button[id="idSIButton9"]',
           'button:has-text("Next")', 'button:has-text("Sign in")',
@@ -194,6 +197,7 @@ const log = (...a) => console.log('[citrix]', ...a);
         await field.waitFor({ state: 'editable', timeout: 10000 }).catch(() => {});
       } catch (_) {}
       if (field) {
+        log('password: field ready, filling (t=' + T() + ')');
         // Fill and confirm the value sticks before we submit (avoids empty-form submit).
         let ok = false;
         for (let attempt = 0; attempt < 5 && !ok; attempt++) {
@@ -204,7 +208,7 @@ const log = (...a) => console.log('[citrix]', ...a);
         // Re-verify the value is actually present right before submitting.
         const verifyVal = await field.inputValue({ timeout: 2000 }).catch(() => '');
         const retained = verifyVal === PASSWORD;
-        log(retained ? `Filled password (${Date.now() - t0}ms, retained)` : `WARN: password not retained (got "${verifyVal}") — submitting anyway`);
+        log(retained ? `Filled password (${Date.now() - t0}ms, retained, t=${T()})` : `WARN: password not retained (got "${verifyVal}", t=${T()}) — submitting anyway`);
         if (retained) {
           const clicked = await clickFirst([
             'input[id="idSIButton9"]', 'button[id="idSIButton9"]',
