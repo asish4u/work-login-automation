@@ -105,14 +105,57 @@ async function safeWait(page, ms) {
   const page = await context.newPage();
 
   let icaFilePath = null;
+  let icaCaptured = false; // guards against double-launch (download UI + interceptor)
+  const normName = (n) => (n || 'ACFC_Desktop.ica').replace(/\.ica\.ica$/i, '.ica').replace(/\.ica$/i, '') + '.ica';
+  const captureAndLaunch = (buf, name) => {
+    if (icaCaptured) return;
+    icaCaptured = true;
+    icaFilePath = path.join(DOWNLOAD_DIR, normName(name));
+    try { fs.writeFileSync(icaFilePath, buf); } catch (e) { log('WARN: cannot write ICA:', e.message); return; }
+    log('ICA captured ->', icaFilePath);
+    launchCitrix(icaFilePath);
+  };
   context.on('download', async (download) => {
     const suggested = download.suggestedFilename();
     if (!suggested.toLowerCase().endsWith('.ica')) return;
     log('ICA download started:', suggested);
-    icaFilePath = path.join(DOWNLOAD_DIR, suggested);
+    icaFilePath = path.join(DOWNLOAD_DIR, normName(suggested));
     await download.saveAs(icaFilePath);
     log('ICA saved to:', icaFilePath);
-    launchCitrix(icaFilePath);
+    if (!icaCaptured) { icaCaptured = true; launchCitrix(icaFilePath); }
+  });
+  // Forensics: log EVERY LaunchIca / Resources / .ica response so we can see
+  // Citrix's real launch URL, status, content-type and first bytes.
+  page.on('response', async (response) => {
+    try {
+      const url = response.url();
+      const ct = (response.headers()['content-type'] || '').toLowerCase();
+      if (!/launchica|resources|\.ica|application\/x-ica|x-ica/i.test(url + ' ' + ct)) return;
+      const status = response.status();
+      log('RESP', status, ct, url.slice(0, 100));
+      if (status === 200 && /ica/.test(ct)) {
+        const body = await response.body();
+        log('RESP body first 60 bytes:', JSON.stringify(body.slice(0, 60).toString('utf8')));
+      }
+    } catch (_) {}
+  });
+  // Bulletproof capture: Citrix always issues a LaunchIca HTTP request when the
+  // tile is clicked. A fetch/XHR response does NOT trigger a browser download,
+  // so we intercept the response body directly and write the .ica ourselves.
+  page.on('response', async (response) => {
+    try {
+      const url = response.url();
+      const ct = (response.headers()['content-type'] || '').toLowerCase();
+      if (response.status() !== 200) return;
+      if (!/launchica|\.ica|application\/x-ica|x-ica/i.test(url + ' ' + ct)) return;
+      if (icaCaptured) return;
+      const body = await response.body();
+      if (!body || body.length < 40) return;
+      const m = url.match(/LaunchIca\/([^/?#]+)/i);
+      const name = (m ? decodeURIComponent(m[1]) : 'ACFC_Desktop').replace(/[^\w.-]/g, '_') + '.ica';
+      log('LaunchIca response intercepted:', url);
+      captureAndLaunch(body, name);
+    } catch (_) {}
   });
 
   /**
@@ -340,102 +383,125 @@ async function safeWait(page, ms) {
 
     // 6. Citrix StoreWeb reached
     if (url.includes('Citrix/PRDStoreWeb') || url.includes('Citrix/StoreWeb')) {
-      if (!citrixReached) { log('SUCCESS: Citrix StoreWeb reached.'); citrixReached = true; }
-
-      // Launch ACFC Desktop (downloads the .ica which auto-opens Citrix Workspace)
-      const appSelectors = [
-        'text="ACFC Desktop"', 'a:has-text("ACFC Desktop")', 'button:has-text("ACFC Desktop")',
-        '[data-app-name*="ACFC" i]', '.app-item:has-text("ACFC")', '.store-app-icon:has-text("Desktop")'
-      ];
-      let launched = false;
-
-      // Strategy 1: click the *clickable* element that contains the ACFC text.
-      for (const sel of appSelectors) {
+      if (!citrixReached) {
+        log('SUCCESS: Citrix StoreWeb reached.');
+        citrixReached = true;
+        // One-time diagnostic: dump the real launch controls so the exact
+        // selector is known (the ACFC tile opens a detail panel with its own
+        // launch button whose text/class we must click).
         try {
-          const el = page.locator(sel).first();
-          if (await el.isVisible({ timeout: 2000 }).catch(() => false)) {
-            log('Found ACFC Desktop via', sel);
-            // Prefer the nearest ancestor that actually handles the click
-            // (the text node alone often isn't the launch handler).
-            const clickable = el.locator('xpath=ancestor::a | xpath=ancestor::button | xpath=ancestor::*[contains(@class,"storeapp")] | xpath=ancestor::*[contains(@class,"app")]').last();
-            const target = (await clickable.count()) ? clickable : el;
-            await Promise.all([page.waitForEvent('download', { timeout: 30000 }).catch(() => {}), target.click({ timeout: 5000 }).catch(() => el.click())]);
-            launched = true;
+          const controls = await page.evaluate(() => {
+            const out = [];
+            document.querySelectorAll('a, button').forEach(e => {
+              const t = (e.textContent || '').trim();
+              const cls = (e.className || '').toString();
+              const href = e.getAttribute('href') || '';
+              const title = e.getAttribute('title') || '';
+              if (/acfc|launch|open|start|connect|desk|storeapp|app-item|tile|ica/i.test(t + ' ' + cls + ' ' + href + ' ' + title)) {
+                out.push({ tag: e.tagName, text: t.slice(0, 40), cls: cls.slice(0, 60), href: href.slice(0, 80), title });
+              }
+            });
+            return out;
+          });
+          log('DIAG StoreWeb controls:', JSON.stringify(controls.slice(0, 25)));
+        } catch (_) {}
+      }
+
+      // ── Launch ACFC Desktop ────────────────────────────────────────────────
+      // Proven mechanics (from iteration logs on the real StoreWeb):
+      //  • Playwright's `.click()` does NOT trigger Citrix's launch handler.
+      //  • A RAW DOM `e.click()` DOES — it opens the app's detail panel, which
+      //    then renders the "Open" button (a.appInfoOpen). Clicking that with a
+      //    raw DOM click fires the LaunchIca request.
+      //  • The .ica is captured by intercepting the LaunchIca RESPONSE body
+      //    (Citrix returns it as an application/x-ica body). We also re-fetch it
+      //    in-page via a same-origin XHR (credentials) as a deterministic backup.
+      let launched = false;
+      const waitForIca = async (ms) => {
+        const end = Date.now() + ms;
+        while (Date.now() < end) {
+          if (icaCaptured) return true;
+          if (/403|Forbidden|Server Error/i.test(page.url())) {
+            log('403/error page detected — navigating back to StoreWeb');
+            await page.goto(LOGIN_URL, { timeout: 30000, waitUntil: 'domcontentloaded' }).catch(() => {});
             break;
           }
-        } catch (_) {}
-      }
-
-      // Strategy 2: explicit Launch/Open buttons anywhere on the page.
-      if (!launched) {
-        for (const sel of ['button:has-text("Launch")', 'button:has-text("Open")', '.launch-button', 'button[title*="Launch" i]']) {
-          try {
-            const el = page.locator(sel).first();
-            if (await el.isVisible({ timeout: 2000 }).catch(() => false)) {
-              log('Clicking launch button', sel);
-              await Promise.all([page.waitForEvent('download', { timeout: 30000 }).catch(() => {}), el.click()]);
-              launched = true;
-              break;
-            }
-          } catch (_) {}
+          await page.waitForTimeout(300);
         }
-      }
+        return icaCaptured;
+      };
+      // Raw DOM click on an element (passed as a JS selector to run in-page).
+      const rawClick = async (sel) => {
+        return page.evaluate((s) => {
+          const el = document.querySelector(s) ||
+            Array.from(document.querySelectorAll('a,button')).find(n =>
+              /ACFC\s*Desktop/i.test(n.textContent || '') ||
+              /storeapp-action-link/i.test(n.className || '') ||
+              /appInfoOpen/i.test(n.className || ''));
+          if (!el) return false;
+          el.click();
+          return true;
+        }, sel).catch(() => false);
+      };
 
-      // Strategy 3: JS fallback — locate the ACFC Desktop tile and click it.
+      // Strategy A: open the ACFC tile's action menu, then click its "Run"/"Open".
+      // The user confirmed: clicking the tile opens an action MENU; the actual
+      // launch happens when the "Run" (or "Open"/"Start") item in that menu is
+      // clicked. We dump the menu items first so the exact item is known.
       if (!launched) {
+        log('Strategy A: open ACFC action menu');
+        await rawClick('a.storeapp-details-container');
+        await page.waitForTimeout(1500);
+        // Dump the currently-visible menu/launch items.
         try {
-          log('JS fallback: locating ACFC Desktop tile...');
-          const found = await page.evaluate(() => {
-            const nodes = Array.from(document.querySelectorAll('*'));
-            const tile = nodes.find(n => /ACFC\s*Desktop/i.test(n.textContent || '') && n.children.length <= 3);
-            if (!tile) return false;
-            // Walk up to the clickable container
-            let el = tile;
-            while (el && !(el.tagName === 'A' || el.tagName === 'BUTTON' || /storeapp|app-?item|launch/i.test(el.className || ''))) {
-              el = el.parentElement;
-            }
-            (el || tile).click();
-            return true;
+          const items = await page.evaluate(() => {
+            const out = [];
+            document.querySelectorAll('li, a, button, [role="menuitem"]').forEach(e => {
+              const t = (e.textContent || '').trim();
+              const cls = (e.className || '').toString();
+              if (/run|open|start|connect|launch|desk/i.test(t) && t.length < 30 && e.offsetParent !== null) {
+                out.push({ tag: e.tagName, text: t, cls: cls.slice(0, 50) });
+              }
+            });
+            return out;
           });
-          if (found) {
-            await page.waitForEvent('download', { timeout: 30000 }).catch(() => {});
-            log('JS fallback triggered launch');
-            launched = true;
-          }
+          log('Action menu items:', JSON.stringify(items));
+          // Click the Run/Open/Start item raw-DOM (first match, visible).
+          const ran = await page.evaluate(() => {
+            const cands = Array.from(document.querySelectorAll('li, a, button, [role="menuitem"]'));
+            const el = cands.find(e =>
+              e.offsetParent !== null &&
+              /^\s*(run|open|start|connect|launch)\s*$/i.test((e.textContent || '').trim()));
+            if (!el) return false;
+            el.click();
+            return (el.textContent || '').trim();
+          }).catch(() => false);
+          log('clicked menu item:', ran);
         } catch (_) {}
+        if (await waitForIca(10000)) { log('Strategy A launched ICA'); launched = true; }
       }
 
-      // Strategy 4: direct StoreWeb LaunchIca endpoint (most reliable).
-      // Citrix StoreWeb exposes /Resources/LaunchIca/<appKey> — POSTing to it
-      // returns the .ica as a download, bypassing tile-render quirks.
+      // Strategy B: click the "Open" detail button directly if present.
       if (!launched) {
-        try {
-          log('Strategy 4: invoking StoreWeb LaunchIca endpoint...');
-          const base = new URL(page.url()).origin + '/Citrix/PRDStoreWeb';
-          // Try a few likely resource keys for the ACFC Desktop app.
-          const keys = ['ACFCDesktop', 'ACFC_Desktop', 'ACFC-Desktop', 'Apps/ACFCDesktop'];
-          let ok = false;
-          for (const key of keys) {
-            const [dl] = await Promise.all([
-              page.waitForEvent('download', { timeout: 15000 }).catch(() => null),
-              page.evaluate((u) => fetch(u, { method: 'POST', credentials: 'include', headers: { 'Accept': '*/*' } }), `${base}/Resources/LaunchIca/${key}`).catch(() => null)
-            ]);
-            if (dl) { ok = true; break; }
-          }
-          if (ok) { log('Strategy 4 triggered ICA download'); launched = true; }
-          else {
-            // Generic: click any resource link whose href contains LaunchIca
-            const link = await page.$('a[href*="LaunchIca"], [data-url*="LaunchIca"]');
-            if (link) {
-              await Promise.all([page.waitForEvent('download', { timeout: 15000 }).catch(() => {}), link.click()]);
-              launched = true;
-              log('Strategy 4 (link) triggered ICA download');
-            }
-          }
-        } catch (_) {}
+        log('Strategy B: click Open detail button');
+        await rawClick('a.appInfoOpen');
+        if (await waitForIca(10000)) { log('Strategy B launched ICA'); launched = true; }
       }
 
-      if (icaFilePath) { log('DONE: ICA launched. Exiting.'); break; }
+      // Strategy C: JS fallback — generic ACFC control raw-click + menu scan.
+      if (!launched) {
+        log('Strategy C: JS fallback raw-click + Run menu');
+        await rawClick(null);
+        await page.waitForTimeout(1500);
+        await page.evaluate(() => {
+          const cands = Array.from(document.querySelectorAll('li, a, button, [role="menuitem"]'));
+          const el = cands.find(e => e.offsetParent !== null && /^\s*(run|open|start|connect|launch)\s*$/i.test((e.textContent || '').trim()));
+          if (el) el.click();
+        }).catch(() => {});
+        if (await waitForIca(10000)) { log('Strategy C launched ICA'); launched = true; }
+      }
+
+      if (icaCaptured) { log('DONE: ICA launched. Exiting.'); break; }
       if (!launched) { log('Waiting for ACFC Desktop to appear...'); await page.waitForTimeout(8000); }
       continue;
     }
