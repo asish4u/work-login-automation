@@ -214,12 +214,19 @@ async function safeWait(page, ms) {
       if (field) {
         const ok = await fillRobust(field, USERNAME);
         log(ok ? `Filled username (t=${T()})` : `WARN: username value not confirmed (t=${T()})`);
-        // Is a password field present on this same page?
-        const pwdOnPage = await page.locator('input[type="password"]').first().isVisible({ timeout: 800 }).catch(() => false);
+        // Combined email+password page? Entra sometimes renders BOTH fields on
+        // one screen and the primary button (idSIButton9) is "Sign in" — clicking
+        // it submits a BLANK password. The password field often paints a beat
+        // AFTER the email field, so we wait up to 3s for it to appear before we
+        // decide. If it shows up, defer the submit to the password step (which
+        // fills + submits with the password confirmed). This is the fix for the
+        // "empty-first-submit at ~3s, real submit at ~10s" symptom.
+        let pwdOnPage = false;
+        try {
+          await page.waitForSelector('input[type="password"]', { state: 'visible', timeout: 3000 });
+          pwdOnPage = true;
+        } catch (_) {}
         if (pwdOnPage) {
-          // Combined page: do NOT click the primary button here. Let step 2 fill
-          // the password and submit it (with the password confirmed). Mark email
-          // done so step 2 can run, but do NOT trigger a submit now.
           log('email: password field present on same page — deferring submit to password step (t=' + T() + ')');
           emailSubmitted = true;
           continue;
