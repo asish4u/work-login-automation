@@ -50,6 +50,11 @@ cp .env.example .env
 
 ## Run
 
+**Easiest (macOS):** double-click `run.command` — it opens a Terminal, runs the
+script, and waits at the 2FA step for you.
+
+**Or from a terminal:**
+
 ```bash
 node login.js
 ```
@@ -57,6 +62,8 @@ node login.js
 A visible Firefox window opens. Watch it progress through the steps; when the
 **2FA** step prints `=== 2FA REQUIRED ===`, switch to the browser, approve the
 prompt / enter the code, and the automation finishes on its own.
+
+To stop early, just close the browser window or press `Ctrl+C` in the terminal.
 
 To stop early, just close the browser window or press `Ctrl+C` in the terminal.
 
