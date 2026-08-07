@@ -174,7 +174,8 @@ const log = (...a) => console.log('[citrix]', ...a);
           await Promise.all([page.waitForNavigation({ timeout: 15000 }).catch(() => {}), page.keyboard.press('Enter')]);
         }
         emailSubmitted = true;
-        await page.waitForTimeout(3000);
+        // No fixed sleep here — waitForSelector in the next iteration handles
+        // password-field readiness without adding padding on top of SSO latency.
         continue;
       }
     }
@@ -215,7 +216,8 @@ const log = (...a) => console.log('[citrix]', ...a);
           }
         }
         passwordSubmitted = true;
-        await page.waitForTimeout(4000);
+        // No fixed sleep — the next loop iteration waits for the post-sign-in
+        // step (Stay-signed-in / Continue) without adding avoidable padding.
         continue;
       }
     }
