@@ -69,41 +69,35 @@ async function safeWait(page, ms) {
   /**
    * Robust fill for Entra ID / ADFS fields.
    *
-   * CRITICAL: Entra password/username fields are React-controlled inputs. A raw
-   * DOM value injection sets el.value but React's internal state can stay EMPTY,
-   * so a subsequent "Sign in" submit reads no password and the form bounces —
-   * which is exactly the "submits empty, then fills ~15s later" symptom.
-   *
-   * So we fill with REAL keystrokes first (React always registers these), which
-   * makes the inputValue() confirmation trustworthy. DOM injection is kept only
-   * as a last-resort fallback for non-React pages.
-   * Returns true only if the field ends up holding the value.
+   * The PRIMARY method is Playwright's native `fill()` — it dispatches the
+   * correct React input events and is effectively instant (no per-char delay).
+   * We then READ BACK the value; Entra's field is React-controlled, so if the
+   * value didn't stick we retry (Entra sometimes swallows the first fill while
+   * the field is still binding). Keystroke typing is the last-resort fallback.
+   * Returns true ONLY if the field genuinely ends up holding the value.
    */
   async function fillRobust(locator, value) {
-    // Primary: real keystroke simulation. React registers these natively,
-    // so inputValue() afterward is a reliable confirmation.
+    for (let attempt = 0; attempt < 8; attempt++) {
+      try {
+        await locator.click({ timeout: 2000 }).catch(() => {});
+        await locator.fill(value, { timeout: 3000 });
+      } catch (_) {}
+      const current = await locator.inputValue({ timeout: 1500 }).catch(() => '');
+      if (current === value) return true;
+      // value didn't stick — clear and retry shortly
+      try { await locator.fill('', { timeout: 1000 }).catch(() => {}); } catch (_) {}
+      await page.waitForTimeout(300);
+    }
+    // Fallback: real keystrokes (slow but always registers in React state)
     try {
       await locator.click({ timeout: 2000 }).catch(() => {});
       await locator.fill('', { timeout: 1500 }).catch(() => {});
-      await locator.pressSequentially(value, { delay: 25 });
+      await locator.pressSequentially(value, { delay: 15 });
       const current = await locator.inputValue({ timeout: 1500 }).catch(() => '');
-      if (current === value) return true;
-    } catch (_) {}
-
-    // Fallback: DOM value injection (may not register in React state).
-    try {
-      await locator.click({ timeout: 2000 }).catch(() => {});
-      await locator.evaluate((el, v) => {
-        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-        setter.call(el, v);
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-      }, value);
-      const current = await locator.inputValue({ timeout: 1500 }).catch(() => '');
-      if (current === value) return true;
-    } catch (_) {}
-
-    return false;
+      return current === value;
+    } catch (_) {
+      return false;
+    }
   }
 
   function launchCitrix(ica) {
@@ -186,30 +180,30 @@ async function safeWait(page, ms) {
       }
     }
 
-    // 2. Password — actively wait for the field, fill only once it's bound,
-    //    and submit ONLY after the value is confirmed retained (Entra rebinds React state).
+    // 2. Password — wait for the field, fill it (instant via Playwright fill()),
+    //    and submit ONLY after the value is confirmed present in the field.
     if (emailSubmitted && !passwordSubmitted) {
       const passSel = 'input[name="passwd"], input[name="Password"], input[id="i0118"], input[type="password"]';
       let field = null;
       try {
+        // visible is enough; Entra's field is interactive as soon as it paints.
         await page.waitForSelector(passSel, { state: 'visible', timeout: 30000 });
         field = page.locator(passSel).first();
-        // Entra's React field mounts before it's interactive; wait until editable.
-        await field.waitFor({ state: 'editable', timeout: 10000 }).catch(() => {});
       } catch (_) {}
       if (field) {
         log('password: field ready, filling (t=' + T() + ')');
-        // Fill and confirm the value sticks before we submit (avoids empty-form submit).
+        // fillRobust retries internally until the value truly sticks, so by the
+        // time we reach here the field holds PASSWORD (or we give up honestly).
         let ok = false;
-        for (let attempt = 0; attempt < 5 && !ok; attempt++) {
+        for (let attempt = 0; attempt < 3 && !ok; attempt++) {
           ok = await fillRobust(field, PASSWORD);
-          if (!ok) await page.waitForTimeout(800);
+          if (!ok) { log('WARN: password not retained, retrying (t=' + T() + ')'); await page.waitForTimeout(500); }
         }
-        const t0 = Date.now();
-        // Re-verify the value is actually present right before submitting.
         const verifyVal = await field.inputValue({ timeout: 2000 }).catch(() => '');
         const retained = verifyVal === PASSWORD;
-        log(retained ? `Filled password (${Date.now() - t0}ms, retained, t=${T()})` : `WARN: password not retained (got "${verifyVal}", t=${T()}) — submitting anyway`);
+        log(retained
+          ? `Filled password (retained, t=${T()})`
+          : `WARN: password not retained (got "${verifyVal}") — NOT submitting empty form`);
         if (retained) {
           const clicked = await clickFirst([
             'input[id="idSIButton9"]', 'button[id="idSIButton9"]',
@@ -222,8 +216,6 @@ async function safeWait(page, ms) {
           }
         }
         passwordSubmitted = true;
-        // No fixed sleep — the next loop iteration waits for the post-sign-in
-        // step (Stay-signed-in / Continue) without adding avoidable padding.
         continue;
       }
     }
