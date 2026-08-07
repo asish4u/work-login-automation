@@ -33,6 +33,12 @@ if (!USERNAME || !PASSWORD) {
 
 const log = (...a) => console.log('[citrix]', ...a);
 
+// Safe wait that no-ops if the page/context has already closed (e.g. after the
+// .ica launches and Citrix Workspace takes over the browser).
+async function safeWait(page, ms) {
+  try { await page.waitForTimeout(ms); } catch (_) {}
+}
+
 (async () => {
   const T0 = Date.now();
   const T = () => ((Date.now() - T0) / 1000).toFixed(1) + 's';
@@ -366,13 +372,13 @@ const log = (...a) => console.log('[citrix]', ...a);
       continue;
     }
 
-    await page.waitForTimeout(2000);
-  }
+    await safeWait(page, 2000);
+    }
 
-  log('Final URL:', page.url());
-  await page.waitForTimeout(2000);
-  await context.close();
-  log('Browser closed.');
+    log('Final URL:', page.url());
+    await safeWait(page, 2000);
+    await context.close().catch(() => {});
+    log('Browser closed.');
 })().catch((err) => {
   console.error('FATAL:', err);
   process.exit(1);
