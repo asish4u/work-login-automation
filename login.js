@@ -20,6 +20,7 @@ const fs = require('fs');
 const { exec, execSync } = require('child_process');
 
 const PID = process.pid;
+const DEBUG_LOG = path.join(__dirname, 'debug-' + Date.now() + '.log');
 
 // ── Single-instance guard (ATOMIC — no TOCTOU race) ──────────────────────
 // Two concurrent runs share the same user_data profile and race each other's
@@ -74,7 +75,11 @@ if (!USERNAME || !PASSWORD) {
   process.exit(1);
 }
 
-const log = (...a) => console.log('[citrix][pid=' + PID + ']', ...a);
+const log = (...a) => {
+  const line = '[citrix][pid=' + PID + '] ' + a.map(x => (x instanceof Error ? x.message : (typeof x === 'object' ? JSON.stringify(x) : x))).join(' ');
+  console.log(line);
+  try { fs.appendFileSync(DEBUG_LOG, line + '\n'); } catch (_) {}
+};
 
 // Safe wait that no-ops if the page/context has already closed (e.g. after the
 // .ica launches and Citrix Workspace takes over the browser).
@@ -214,20 +219,20 @@ async function safeWait(page, ms) {
       if (field) {
         const ok = await fillRobust(field, USERNAME);
         log(ok ? `Filled username (t=${T()})` : `WARN: username value not confirmed (t=${T()})`);
-        // Combined email+password page? Entra sometimes renders BOTH fields on
-        // one screen and the primary button (idSIButton9) is "Sign in" — clicking
-        // it submits a BLANK password. The password field often paints a beat
-        // AFTER the email field, so we wait up to 3s for it to appear before we
-        // decide. If it shows up, defer the submit to the password step (which
-        // fills + submits with the password confirmed). This is the fix for the
-        // "empty-first-submit at ~3s, real submit at ~10s" symptom.
-        let pwdOnPage = false;
+        // Hard guard: NEVER click the primary button (Next/Sign in) while a
+        // password field is present but EMPTY — that is exactly the
+        // "empty-first-submit" symptom. Combined pages, delayed paints, and any
+        // other structure all funnel through here. Wait up to 3s for the password
+        // field to appear; if it does (blank), defer the submit to the password
+        // step, which fills it and submits only after confirmation.
+        let pwdPresentBlank = false;
         try {
           await page.waitForSelector('input[type="password"]', { state: 'visible', timeout: 3000 });
-          pwdOnPage = true;
+          const pv = await page.locator('input[type="password"]').first().inputValue({ timeout: 1000 }).catch(() => '');
+          pwdPresentBlank = (pv.length === 0);
         } catch (_) {}
-        if (pwdOnPage) {
-          log('email: password field present on same page — deferring submit to password step (t=' + T() + ')');
+        if (pwdPresentBlank) {
+          log('email: password field present and BLANK — deferring submit to password step (t=' + T() + ')');
           emailSubmitted = true;
           continue;
         }
