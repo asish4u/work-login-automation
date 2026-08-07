@@ -313,6 +313,36 @@ const log = (...a) => console.log('[citrix]', ...a);
         } catch (_) {}
       }
 
+      // Strategy 4: direct StoreWeb LaunchIca endpoint (most reliable).
+      // Citrix StoreWeb exposes /Resources/LaunchIca/<appKey> — POSTing to it
+      // returns the .ica as a download, bypassing tile-render quirks.
+      if (!launched) {
+        try {
+          log('Strategy 4: invoking StoreWeb LaunchIca endpoint...');
+          const base = new URL(page.url()).origin + '/Citrix/PRDStoreWeb';
+          // Try a few likely resource keys for the ACFC Desktop app.
+          const keys = ['ACFCDesktop', 'ACFC_Desktop', 'ACFC-Desktop', 'Apps/ACFCDesktop'];
+          let ok = false;
+          for (const key of keys) {
+            const [dl] = await Promise.all([
+              page.waitForEvent('download', { timeout: 15000 }).catch(() => null),
+              page.evaluate((u) => fetch(u, { method: 'POST', credentials: 'include', headers: { 'Accept': '*/*' } }), `${base}/Resources/LaunchIca/${key}`).catch(() => null)
+            ]);
+            if (dl) { ok = true; break; }
+          }
+          if (ok) { log('Strategy 4 triggered ICA download'); launched = true; }
+          else {
+            // Generic: click any resource link whose href contains LaunchIca
+            const link = await page.$('a[href*="LaunchIca"], [data-url*="LaunchIca"]');
+            if (link) {
+              await Promise.all([page.waitForEvent('download', { timeout: 15000 }).catch(() => {}), link.click()]);
+              launched = true;
+              log('Strategy 4 (link) triggered ICA download');
+            }
+          }
+        } catch (_) {}
+      }
+
       if (icaFilePath) { log('DONE: ICA launched. Exiting.'); break; }
       if (!launched) { log('Waiting for ACFC Desktop to appear...'); await page.waitForTimeout(8000); }
       continue;
